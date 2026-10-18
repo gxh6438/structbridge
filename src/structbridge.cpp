@@ -899,7 +899,7 @@ private:
 class ApiImpl;
 ApiImpl *g_api_instance = nullptr;               // created in onLoad, alive for the process
 ApiImpl *createApiImpl(StructBridgePlugin *plugin);  // defined next to ApiImpl
-constexpr const char *kPluginVersion = "0.0.2";  // twin of the ENDSTONE_PLUGIN version string
+constexpr const char *kPluginVersion = "0.0.3";  // twin of the ENDSTONE_PLUGIN version string
 
 // ---------------------------------------------------------------------------
 // Config
@@ -3360,7 +3360,7 @@ extern "C" STRUCTBRIDGE_EXPORT structbridge::IApi *structbridge_get_api(void)
     return structbridge::g_api_instance;
 }
 
-ENDSTONE_PLUGIN("structbridge", "0.0.2", structbridge::StructBridgePlugin)
+ENDSTONE_PLUGIN("structbridge", "0.0.3", structbridge::StructBridgePlugin)
 {
     description = "Server-side export/import of official .mcstructure files, with a crash-safe native probe.";
     website = "https://github.com/gxh6438/structbridge";
