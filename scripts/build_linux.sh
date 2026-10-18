@@ -198,6 +198,7 @@ fi
     -I"${GEN_INC}" \
     "${PYTHON_FLAGS[@]}" \
     "${ROOT}/src/structbridge.cpp" \
+    "${ROOT}/src/leveldb_scan.cpp" \
     "${ROOT}/src/glibc_compat_impl.cpp" \
     "${LIBCXX_A}" "${LIBCXXABI_A}" \
     -Wl,--no-as-needed,/usr/lib/x86_64-linux-gnu/libpthread.so.0,/usr/lib/x86_64-linux-gnu/libdl.so.2 -Wl,--as-needed -lm \

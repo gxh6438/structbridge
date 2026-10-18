@@ -177,6 +177,7 @@ cd "${ROOT}"
     /I"${MSVC}/sdk/include/cppwinrt" \
     -fuse-ld=lld-link \
     src/structbridge.cpp \
+    src/leveldb_scan.cpp \
     /Fe:"${OUT}" \
     /link \
     /libpath:"${MSVC}/crt/lib/x86_64" \

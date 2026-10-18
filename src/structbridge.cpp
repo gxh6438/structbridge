@@ -105,6 +105,7 @@
 #include "glibc_compat.h"
 #define STRUCTBRIDGE_BUILDING 1
 #include "structbridge_api.h"
+#include "leveldb_scan.h"  // read-only world LevelDB scanner (/structlist world source)
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -831,17 +832,25 @@ private:
     // at level start and loads them lazily - no plugin-side memory cost).
     [[nodiscard]] fs::path libraryDir() const;
     [[nodiscard]] fs::path packStructuresDir() const;
+    [[nodiscard]] fs::path behaviorPacksDir() const;  // <server>/behavior_packs
+    // <server>/worlds/<level-name>/db - level-name from server.properties
+    // (BDS default "Bedrock Level").
+    [[nodiscard]] fs::path worldDbDir() const;
     static void writeStructureFile(const fs::path &file, const std::vector<std::uint8_t> &bytes);
     void syncExportsToPack();
 
-    // One structure known to the plugin (a .mcstructure file in the library
-    // and/or the pack mirror).
+    // One structure visible on this server, merged across its sources.
     struct LibItem {
         std::string key;     // e.g. "mystructure:house" (lookup key / engine key)
         std::string local;   // e.g. "house"
         std::string ns;      // e.g. "mystructure"
-        fs::path file;       // representative file (library preferred)
+        fs::path file;       // representative file (library preferred, else pack)
         std::uintmax_t size = 0;
+        // v0.0.2 sources - the same name can exist in several at once.
+        bool in_library = false;  // plugin exports dir (or its legacy default/ layout)
+        bool in_pack = false;     // some behavior pack's structures/ dir (read-only game data)
+        bool in_world = false;    // world LevelDB entry (structure block / "save ... disk")
+        fs::path mirror;          // the plugin's own pack mirror file, if present (deletable)
     };
     [[nodiscard]] std::vector<LibItem> collectStructures() const;
 
@@ -890,7 +899,7 @@ private:
 class ApiImpl;
 ApiImpl *g_api_instance = nullptr;               // created in onLoad, alive for the process
 ApiImpl *createApiImpl(StructBridgePlugin *plugin);  // defined next to ApiImpl
-constexpr const char *kPluginVersion = "0.0.1";  // twin of the ENDSTONE_PLUGIN version string
+constexpr const char *kPluginVersion = "0.0.2";  // twin of the ENDSTONE_PLUGIN version string
 
 // ---------------------------------------------------------------------------
 // Config
@@ -1293,22 +1302,118 @@ void StructBridgePlugin::runProbe(bool manual)
 // ---------------------------------------------------------------------------
 // Name / path helpers
 // ---------------------------------------------------------------------------
+// fs::path <-> UTF-8 std::string.
+//
+// On POSIX the narrow encoding is UTF-8 on any realistic host, so paths pass
+// through unchanged. On Windows, fs::path's NARROW conversions go through the
+// ANSI code page, which mangles Chinese structure names - so build/convert
+// paths through the wide API there instead.
+namespace {
+fs::path pathFromUtf8(const std::string &s)
+{
+#if defined(_WIN32)
+    if (s.empty()) {
+        return fs::path();
+    }
+    const int need = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (need <= 0) {
+        return fs::path(s);  // not valid UTF-8 - fall back to the old behavior
+    }
+    std::wstring w(static_cast<std::size_t>(need), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), need);
+    return fs::path(w);
+#else
+    return fs::path(s);
+#endif
+}
+
+std::string pathToUtf8(const fs::path &p)
+{
+#if defined(_WIN32)
+    const std::wstring w = p.native();
+    if (w.empty()) {
+        return {};
+    }
+    const int need = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    if (need <= 0) {
+        return p.string();
+    }
+    std::string out(static_cast<std::size_t>(need), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), out.data(), need, nullptr, nullptr);
+    return out;
+#else
+    return p.string();
+#endif
+}
+}  // namespace
+
 bool StructBridgePlugin::isValidStructureName(const std::string &name)
 {
+    // The ENGINE has no restriction here (LevelDB stores keys verbatim;
+    // structure blocks and /structure load accept any UTF-8 name - verified
+    // in the sandbox with mystructure:中文屋2). v0.0.1 wrongly rejected every
+    // non-ASCII byte, which made Chinese names unusable. Now well-formed
+    // UTF-8 is accepted; still rejected are control characters, spaces,
+    // quotes and path separators (they break the vanilla command line or the
+    // on-disk layout) plus a second namespace colon.
     if (name.empty() || name.size() > 128) {
         return false;
     }
     bool has_colon = false;
-    for (char c : name) {
-        if (c == ':') {
-            if (has_colon) {
+    std::size_t i = 0;
+    while (i < name.size()) {
+        const auto c = static_cast<unsigned char>(name[i]);
+        if (c < 0x80) {
+            if (c == ':') {
+                if (has_colon) {
+                    return false;
+                }
+                has_colon = true;
+            }
+            else if (!(std::isalnum(c) || c == '_' || c == '-' || c == '.')) {
                 return false;
             }
-            has_colon = true;
+            ++i;
+            continue;
         }
-        else if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == '.')) {
+        // Multibyte UTF-8: validate the whole sequence, then accept verbatim.
+        unsigned cp = 0;
+        int len;
+        if ((c & 0xE0) == 0xC0) {
+            len = 2;
+            cp = c & 0x1F;
+        }
+        else if ((c & 0xF0) == 0xE0) {
+            len = 3;
+            cp = c & 0x0F;
+        }
+        else if ((c & 0xF8) == 0xF0) {
+            len = 4;
+            cp = c & 0x07;
+        }
+        else {
+            return false;  // stray continuation byte or 0xF8+
+        }
+        if (i + static_cast<std::size_t>(len) > name.size()) {
+            return false;  // truncated sequence
+        }
+        for (int k = 1; k < len; ++k) {
+            const auto cc = static_cast<unsigned char>(name[i + static_cast<std::size_t>(k)]);
+            if ((cc & 0xC0) != 0x80) {
+                return false;
+            }
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if ((len == 2 && cp < 0x80) || (len == 3 && cp < 0x800) || (len == 4 && cp < 0x10000)) {
+            return false;  // overlong encoding
+        }
+        if (cp >= 0xD800 && cp <= 0xDFFF) {
+            return false;  // surrogate half
+        }
+        if (cp > 0x10FFFF) {
             return false;
         }
+        i += static_cast<std::size_t>(len);
     }
     return true;
 }
@@ -1322,24 +1427,59 @@ fs::path StructBridgePlugin::sanitizeRelativePath(const std::string &name)
         ns = name.substr(0, pos);
         local = name.substr(pos + 1);
     }
-    std::string safe_ns, safe_local;
-    for (char c : ns) {
-        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == '.') {
-            safe_ns += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    // Keep the ASCII allow-list (lowercased) AND valid UTF-8 multibyte
+    // sequences verbatim (Chinese names!); drop everything else. Only ASCII
+    // letters are lowercased - std::tolower on multibyte lead/continuation
+    // bytes would corrupt them, and the engine does not fold case anyway.
+    auto clean = [](const std::string &in) {
+        std::string out;
+        out.reserve(in.size());
+        std::size_t i = 0;
+        while (i < in.size()) {
+            const auto c = static_cast<unsigned char>(in[i]);
+            if (c < 0x80) {
+                if (std::isalnum(c) || c == '_' || c == '-' || c == '.') {
+                    out += static_cast<char>(std::tolower(c));
+                }
+                ++i;
+                continue;
+            }
+            int len;
+            if ((c & 0xE0) == 0xC0) {
+                len = 2;
+            }
+            else if ((c & 0xF0) == 0xE0) {
+                len = 3;
+            }
+            else if ((c & 0xF8) == 0xF0) {
+                len = 4;
+            }
+            else {
+                ++i;
+                continue;  // stray byte - drop it
+            }
+            bool valid = i + static_cast<std::size_t>(len) <= in.size();
+            for (int k = 1; valid && k < len; ++k) {
+                valid = (static_cast<unsigned char>(in[i + static_cast<std::size_t>(k)]) & 0xC0) == 0x80;
+            }
+            if (!valid) {
+                ++i;
+                continue;
+            }
+            out.append(in, i, static_cast<std::size_t>(len));
+            i += static_cast<std::size_t>(len);
         }
-    }
-    for (char c : local) {
-        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == '.') {
-            safe_local += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
-    }
+        return out;
+    };
+    std::string safe_ns = clean(ns);
+    std::string safe_local = clean(local);
     if (safe_ns.empty()) {
         safe_ns = "mystructure";
     }
     if (safe_local.empty()) {
         safe_local = "structure";
     }
-    return fs::path(safe_ns) / (safe_local + ".mcstructure");
+    return pathFromUtf8(safe_ns) / pathFromUtf8(safe_local + ".mcstructure");
 }
 
 // ---------------------------------------------------------------------------
@@ -1355,6 +1495,35 @@ fs::path StructBridgePlugin::packStructuresDir() const
     // getDataFolder() is <server>/plugins/structbridge, so the bedrock_server
     // root is two levels up.
     return getDataFolder().parent_path().parent_path() / "behavior_packs" / "vanilla" / "structures";
+}
+
+fs::path StructBridgePlugin::behaviorPacksDir() const
+{
+    return getDataFolder().parent_path().parent_path() / "behavior_packs";
+}
+
+fs::path StructBridgePlugin::worldDbDir() const
+{
+    // World folder comes from server.properties' level-name (default
+    // "Bedrock Level"); the LevelDB lives at worlds/<level-name>/db.
+    const fs::path root = getDataFolder().parent_path().parent_path();
+    std::string level_name = "Bedrock Level";
+    std::ifstream props(root / "server.properties");
+    std::string line;
+    while (std::getline(props, line)) {
+        if (line.rfind("level-name=", 0) != 0) {
+            continue;
+        }
+        level_name = line.substr(sizeof("level-name=") - 1);
+        while (!level_name.empty() && (level_name.back() == '\r' || level_name.back() == ' ')) {
+            level_name.pop_back();
+        }
+        if (level_name.size() >= 2 && level_name.front() == '"' && level_name.back() == '"') {
+            level_name = level_name.substr(1, level_name.size() - 2);
+        }
+        break;
+    }
+    return root / "worlds" / pathFromUtf8(level_name) / "db";
 }
 
 void StructBridgePlugin::writeStructureFile(const fs::path &file, const std::vector<std::uint8_t> &bytes)
@@ -1394,7 +1563,7 @@ void StructBridgePlugin::syncExportsToPack()
         bool first = true;
         for (const auto &part : rel) {
             if (first) {
-                ns = part.string();
+                ns = pathToUtf8(part);
                 first = false;
             }
             else {
@@ -1409,7 +1578,7 @@ void StructBridgePlugin::syncExportsToPack()
         if (ns == "default") {
             ns = "mystructure";
         }
-        const auto dest = packStructuresDir() / ns / rest;
+        const auto dest = packStructuresDir() / pathFromUtf8(ns) / rest;
         fs::create_directories(dest.parent_path(), ec2);
         std::error_code copy_ec;
         fs::copy_file(entry.path(), dest, fs::copy_options::overwrite_existing, copy_ec);
@@ -1710,8 +1879,8 @@ void StructBridgePlugin::exportTick(std::shared_ptr<ExportJob> job)
                             // memory pre-registration.
                             writeStructureFile(packStructuresDir() / sanitizeRelativePath(job->name), bytes);
                             getLogger().info("Exported '{}' ({} bytes) to {}", job->name, bytes.size(),
-                                             out_file.string());
-                            finishExport(job, "§a导出成功: " + out_file.string() + " (" +
+                                             pathToUtf8(out_file));
+                            finishExport(job, "§a导出成功: " + pathToUtf8(out_file) + " (" +
                                                   std::to_string(bytes.size()) + " 字节, 区域 " +
                                                   std::to_string(job->x1) + " " + std::to_string(job->y1) + " " +
                                                   std::to_string(job->z1) + " -> " + std::to_string(job->x2) + " " +
@@ -1719,7 +1888,7 @@ void StructBridgePlugin::exportTick(std::shared_ptr<ExportJob> job)
                             return;
                         }
                     }
-                    finishExport(job, "§c无法写入文件: " + out_file.string(), STAGE_FILE);
+                    finishExport(job, "§c无法写入文件: " + pathToUtf8(out_file), STAGE_FILE);
                     return;
                 }
                 finishExport(job, std::string("§c序列化失败 (阶段: ") + stageName(bstage) + ")，导出中止。", bstage);
@@ -1846,8 +2015,8 @@ void StructBridgePlugin::handleImport(endstone::CommandSender &sender, const std
     std::string name;
     if (arg.find('/') != std::string::npos || arg.find('\\') != std::string::npos) {
         // Explicit path: the structure name comes from the file name.
-        file = fs::path(arg);
-        name = file.stem().string();
+        file = pathFromUtf8(arg);
+        name = pathToUtf8(file.stem());
     }
     else {
         // Bare name (optionally with the .mcstructure extension): look it up
@@ -1868,7 +2037,8 @@ void StructBridgePlugin::handleImport(endstone::CommandSender &sender, const std
         file = libraryDir() / sanitizeRelativePath(name);
     }
     if (!isValidStructureName(name)) {
-        sender.sendMessage("§c结构名称非法: 只允许 字母/数字/_/-/. 和一个可选的命名空间冒号，例如 123 或 myhouse。");
+        sender.sendMessage("§c结构名称非法: 只允许 中文等UTF-8字符/字母/数字/_/-/. 和一个可选的命名空间冒号，"
+                           "例如 123、myhouse 或 中文屋。");
         return;
     }
     if (!fs::exists(file)) {
@@ -1884,7 +2054,7 @@ void StructBridgePlugin::handleImport(endstone::CommandSender &sender, const std
         }
     }
     if (!fs::exists(file)) {
-        sender.sendMessage("§c文件不存在: {} (未指定路径时自动查找结构库导出目录)", file.string());
+        sender.sendMessage("§c文件不存在: {} (未指定路径时自动查找结构库导出目录)", pathToUtf8(file));
         return;
     }
     std::ifstream in(file, std::ios::binary);
@@ -1919,7 +2089,8 @@ void StructBridgePlugin::handleImport(endstone::CommandSender &sender, const std
     sender.sendMessage(
         "§a导入成功: {}。立即可用: §e/structure load {} [x y z]§a 或在结构块界面输入 §e{}§a；重启后依然可用（已同步到行为包）。",
         name, name, name);
-    getLogger().info("Imported '{}' ({} bytes) from {} into manager key '{}'", name, bytes.size(), file.string(), key);
+    getLogger().info("Imported '{}' ({} bytes) from {} into manager key '{}'", name, bytes.size(), pathToUtf8(file),
+                     key);
 }
 
 // ---------------------------------------------------------------------------
@@ -1948,7 +2119,8 @@ void StructBridgePlugin::handleDump(endstone::CommandSender &sender, const std::
         name = name.substr(1, name.size() - 2);
     }
     if (!isValidStructureName(name)) {
-        sender.sendMessage("§c结构名称非法: 只允许 字母/数字/_/-/. 和一个可选的命名空间冒号，例如 123 或 myhouse。");
+        sender.sendMessage("§c结构名称非法: 只允许 中文等UTF-8字符/字母/数字/_/-/. 和一个可选的命名空间冒号，"
+                           "例如 123、myhouse 或 中文屋。");
         return;
     }
 
@@ -2000,32 +2172,59 @@ void StructBridgePlugin::handleDump(endstone::CommandSender &sender, const std::
     {
         std::ofstream f(out_file, std::ios::binary);
         if (!f) {
-            sender.sendMessage("§c无法写入文件: {}", out_file.string());
+            sender.sendMessage("§c无法写入文件: {}", pathToUtf8(out_file));
             return;
         }
         f.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
         f.close();
         if (!f.good()) {
-            sender.sendMessage("§c无法写入文件: {}", out_file.string());
+            sender.sendMessage("§c无法写入文件: {}", pathToUtf8(out_file));
             return;
         }
     }
     // Mirror into the vanilla behavior pack so the name stays loadable after
     // a restart (and remains available even without this plugin).
     writeStructureFile(packStructuresDir() / sanitizeRelativePath(name), bytes);
-    sender.sendMessage("§a导出成功: {} ({} 字节)", out_file.string(), bytes.size());
-    getLogger().info("Dumped saved structure '{}' ({} bytes) to {}", name, bytes.size(), out_file.string());
+    sender.sendMessage("§a导出成功: {} ({} 字节)", pathToUtf8(out_file), bytes.size());
+    getLogger().info("Dumped saved structure '{}' ({} bytes) to {}", name, bytes.size(), pathToUtf8(out_file));
 }
 
-// Collect every structure the plugin manages: files under the exports library
-// (any namespace folder; the legacy "default" maps to mystructure) and the
-// mystructure mirror inside the vanilla behavior pack. Deduplicated by key.
+// Collect every structure visible on this server, merged and deduplicated by
+// engine key across the three sources it can exist in:
+//   1. the plugin's exports library (any namespace folder; the legacy
+//      "default" maps to mystructure),
+//   2. every behavior pack's structures/ dir - vanilla ships e.g. bastion:,
+//      minecraft:; the engine loads these lazily at level start. The mirror
+//      dirs some tools create (__brarchive/) are SIBLINGS of structures/, so
+//      this walk never enters them. Pack files are read-only game data,
+//      except the plugin's own mystructure/ mirror inside the vanilla pack,
+//   3. the world database (LevelDB): structure block saves and
+//      "/structure save ... disk" entries, Chinese names included (the engine
+//      stores keys as raw UTF-8 - see leveldb_scan.h).
 std::vector<StructBridgePlugin::LibItem> StructBridgePlugin::collectStructures() const
 {
     std::vector<LibItem> items;
     std::map<std::string, std::size_t> index;
 
-    auto add_dir = [&](const fs::path &root, const std::string &forced_ns) {
+    auto upsert = [&](const std::string &key, const std::string &local, const std::string &ns) -> LibItem & {
+        auto it = index.find(key);
+        if (it == index.end()) {
+            index.emplace(key, items.size());
+            LibItem item;
+            item.key = key;
+            item.local = local;
+            item.ns = ns;
+            items.push_back(std::move(item));
+            return items.back();
+        }
+        return items[it->second];
+    };
+
+    // .mcstructure files under root. forced_ns empty -> the first path
+    // component is the namespace folder (the engine's pack layout:
+    // structures/<ns>/<rest>.mcstructure == key "<ns>:<rest>"); otherwise
+    // every file maps into forced_ns.
+    auto add_dir = [&](const fs::path &root, const std::string &forced_ns, bool library, bool mirror_root) {
         std::error_code ec;
         if (!fs::exists(root, ec)) {
             return;
@@ -2050,7 +2249,7 @@ std::vector<StructBridgePlugin::LibItem> StructBridgePlugin::collectStructures()
                 rest.clear();
                 for (const auto &part : rel) {
                     if (first) {
-                        ns = part.string();
+                        ns = pathToUtf8(part);
                         first = false;
                     }
                     else {
@@ -2062,34 +2261,72 @@ std::vector<StructBridgePlugin::LibItem> StructBridgePlugin::collectStructures()
                     rest = rel;
                 }
                 if (ns == "default") {
-                    ns = "mystructure";  // legacy layout
+                    ns = "mystructure";  // legacy library layout
                 }
             }
-            std::string local = rest.replace_extension("").string();
+            std::string local = pathToUtf8(rest.replace_extension(""));
             if (local.empty()) {
                 continue;
             }
-            std::string key = ns + ":" + local;
             auto sz = fs::file_size(entry.path(), ec2);
-            auto it = index.find(key);
-            if (it == index.end()) {
-                index.emplace(key, items.size());
-                items.push_back({key, local, ns, entry.path(), ec2 ? 0 : sz});
+            if (ec2) {
+                sz = 0;
             }
-            else if (ec2) {
-                // keep existing
-            }
-            else if (items[it->second].file.string().find("behavior_packs") != std::string::npos) {
-                items[it->second] = {key, local, ns, entry.path(), sz};  // library copy preferred
+            LibItem &item = upsert(ns + ":" + local, local, ns);
+            if (library) {
+                item.in_library = true;
+                item.file = entry.path();  // library copy preferred as representative
             }
             else {
-                items[it->second].size = std::max(items[it->second].size, sz);
+                item.in_pack = true;
+                if (mirror_root && ns == "mystructure") {
+                    // the plugin's own mirror (vanilla pack never ships a
+                    // mystructure namespace itself) - deletable
+                    item.mirror = entry.path();
+                }
+                if (item.file.empty()) {
+                    item.file = entry.path();
+                }
             }
+            item.size = std::max(item.size, sz);
         }
     };
 
-    add_dir(libraryDir(), "");
-    add_dir(packStructuresDir() / "mystructure", "mystructure");
+    add_dir(libraryDir(), "", true, false);
+    {
+        // every behavior pack (the vanilla one contains the plugin's mirror)
+        std::error_code ec;
+        for (auto &pack : fs::directory_iterator(behaviorPacksDir(), ec)) {
+            std::error_code ec2;
+            if (!pack.is_directory(ec2)) {
+                continue;
+            }
+            const fs::path structs = pack.path() / "structures";
+            add_dir(structs, "", false, structs == packStructuresDir());
+        }
+    }
+    {
+        // world database (fail-soft: owned by the running server)
+        try {
+            for (const auto &ws : ldb::scanStructures(worldDbDir())) {
+                std::string ns = "mystructure";
+                std::string local = ws.key;
+                if (auto pos = ws.key.find(':'); pos != std::string::npos) {
+                    ns = ws.key.substr(0, pos);
+                    local = ws.key.substr(pos + 1);
+                }
+                if (local.empty()) {
+                    continue;
+                }
+                LibItem &item = upsert(ws.key, local, ns);
+                item.in_world = true;
+                item.size = std::max(item.size, static_cast<std::uintmax_t>(ws.size));
+            }
+        }
+        catch (const std::exception &e) {
+            getLogger().warning("World database scan failed ({}); /structlist may miss saved structures.", e.what());
+        }
+    }
 
     std::sort(items.begin(), items.end(), [](const LibItem &a, const LibItem &b) { return a.key < b.key; });
     return items;
@@ -2120,24 +2357,31 @@ void StructBridgePlugin::handleDelete(endstone::CommandSender &sender, const std
     if (args.empty()) {
         handleList(sender);  // show what is about to be deleted
         auto items = collectStructures();
-        if (items.empty()) {
-            sender.sendMessage("§e结构库为空，没有可删除的结构。");
-            return;
-        }
         int structures = 0;
         int files = 0;
         for (const auto &item : items) {
+            // Plugin-managed only: the exports library and our own pack
+            // mirror. Behavior pack structures (vanilla's bastion:,
+            // minecraft:, ...) are game data and stay untouched; world-only
+            // saves are not plugin-managed either (delete those by name).
+            if (!item.in_library && item.mirror.empty()) {
+                continue;
+            }
             getServer().dispatchCommand(getServer().getCommandSender(),
                                         "structure delete \"" + item.key + "\"");
             ++structures;
-            for (const auto &f : {libraryDir() / item.ns / (item.local + ".mcstructure"),
-                                  libraryDir() / "default" / (item.local + ".mcstructure"),
-                                  packStructuresDir() / item.ns / (item.local + ".mcstructure")}) {
+            for (const auto &f : {libraryDir() / pathFromUtf8(item.ns) / pathFromUtf8(item.local + ".mcstructure"),
+                                  libraryDir() / "default" / pathFromUtf8(item.local + ".mcstructure"),
+                                  item.mirror}) {
                 std::error_code ec;
                 if (fs::exists(f, ec) && fs::remove(f, ec)) {
                     ++files;
                 }
             }
+        }
+        if (structures == 0) {
+            sender.sendMessage("§e没有插件管理的结构可删除 (行为包自带与世界独有的结构不受影响)。");
+            return;
         }
         sender.sendMessage("§a已删除全部 {} 个结构 (引擎内存 + 世界数据库)，共清理 {} 个文件。", structures, files);
         getLogger().info("Delete-all: {} structures, {} files removed", structures, files);
@@ -2158,7 +2402,8 @@ void StructBridgePlugin::handleDelete(endstone::CommandSender &sender, const std
         return;
     }
     if (!isValidStructureName(name)) {
-        sender.sendMessage("§c结构名称非法: 只允许 字母/数字/_/-/. 和一个可选的命名空间冒号，例如 123 或 myhouse。");
+        sender.sendMessage("§c结构名称非法: 只允许 中文等UTF-8字符/字母/数字/_/-/. 和一个可选的命名空间冒号，"
+                           "例如 123、myhouse 或 中文屋。");
         return;
     }
     std::string local = name;
@@ -2192,15 +2437,15 @@ void StructBridgePlugin::handleDelete(endstone::CommandSender &sender, const std
 
     // 2) Plugin files: library (current + legacy layout) and the pack mirror.
     std::vector<fs::path> files = {
-        libraryDir() / "mystructure" / (local + ".mcstructure"),
-        libraryDir() / "default" / (local + ".mcstructure"),  // pre-1.3.0 layout
-        packStructuresDir() / "mystructure" / (local + ".mcstructure"),
+        libraryDir() / "mystructure" / pathFromUtf8(local + ".mcstructure"),
+        libraryDir() / "default" / pathFromUtf8(local + ".mcstructure"),  // pre-1.3.0 layout
+        packStructuresDir() / "mystructure" / pathFromUtf8(local + ".mcstructure"),
     };
     std::vector<std::string> removed;
     std::error_code ec;
     for (const auto &f : files) {
         if (fs::exists(f, ec) && fs::remove(f, ec)) {
-            removed.push_back(f.string());
+            removed.push_back(pathToUtf8(f));
         }
     }
 
@@ -2224,11 +2469,10 @@ void StructBridgePlugin::handleDelete(endstone::CommandSender &sender, const std
 }
 
 // ---------------------------------------------------------------------------
-// /structlist - show every structure the plugin manages (exports library +
-// behavior-pack mirror), with file size and whether the template is currently
-// loaded in the engine's StructureManager. Structures saved in-game but never
-// exported/dumped do not live on the filesystem and cannot be enumerated -
-// the footer points at /structdump for those.
+// /structlist - show EVERY structure on this server, merged from the exports
+// library, all behavior packs' structures/ dirs and the world database, with
+// per-source tags, file size and whether the template is currently loaded in
+// the engine's StructureManager.
 // ---------------------------------------------------------------------------
 void StructBridgePlugin::handleList(endstone::CommandSender &sender)
 {
@@ -2237,8 +2481,7 @@ void StructBridgePlugin::handleList(endstone::CommandSender &sender)
     }
     auto items = collectStructures();
     if (items.empty()) {
-        sender.sendMessage("§e结构库为空。导出 (/structexport)、导入 (/structimport) 或转储 (/structdump) "
-                           "过的结构会出现在这里。");
+        sender.sendMessage("§e未找到任何结构 (插件库 / 行为包 / 世界存档 均为空)。");
         return;
     }
 
@@ -2248,7 +2491,16 @@ void StructBridgePlugin::handleList(endstone::CommandSender &sender)
         manager = getManager(getServer(), stage);
     }
 
-    sender.sendMessage("§6共 {} 个结构:", items.size());
+    int n_lib = 0;
+    int n_pack = 0;
+    int n_world = 0;
+    for (const auto &item : items) {
+        n_lib += item.in_library ? 1 : 0;
+        n_pack += item.in_pack ? 1 : 0;
+        n_world += item.in_world ? 1 : 0;
+    }
+    sender.sendMessage("§6共 {} 个结构 §7(§a插件库 {}§7 | §b行为包 {}§7 | §d世界存档 {}§7):", items.size(), n_lib, n_pack,
+                       n_world);
     for (const auto &item : items) {
         char size_buf[32];
         double sz = static_cast<double>(item.size);
@@ -2262,15 +2514,31 @@ void StructBridgePlugin::handleList(endstone::CommandSender &sender)
             std::snprintf(size_buf, sizeof(size_buf), "%u B", static_cast<unsigned>(item.size));
         }
         const bool loaded = manager != nullptr && manager->getStructure(item.key) != nullptr;
+        std::string sources;
+        auto add_src = [&sources](const char *tag) {
+            if (!sources.empty()) {
+                sources += "§7/";
+            }
+            sources += tag;
+        };
+        if (item.in_library) {
+            add_src("§a库");
+        }
+        if (item.in_pack) {
+            add_src("§b包");
+        }
+        if (item.in_world) {
+            add_src("§d世界");
+        }
         // NOTE: size_buf must be wrapped in std::string - libc++ std::format
         // renders a raw char[] as a 32-char RANGE (NULs and stack garbage
         // included), which truncates console output at the first NUL byte.
-        sender.sendMessage("§7 - §f{}§7 ({}§7, {}§7)", item.key, std::string(size_buf),
+        sender.sendMessage("§7 - §f{}§7 ({}§7, {}§7, {}§7)", item.key, sources, std::string(size_buf),
                            loaded ? "§a已加载" : "§7未加载");
     }
-    sender.sendMessage("§7提示: /structdelete <名称> 删除单个; /structdelete 删除全部; "
-                       "游戏内保存但从未导出的结构请先 /structdump <名称>。");
-    getLogger().info("Listed {} structure(s)", items.size());
+    sender.sendMessage("§7来源: §a库§7=插件导出目录 | §b包§7=行为包自带 (受保护, 不参与删除) | "
+                       "§d世界§7=结构块或 /structure save 存档。删除: /structdelete <名称> 或 /structdelete 全部。");
+    getLogger().info("Listed {} structure(s) (library {}, pack {}, world {})", items.size(), n_lib, n_pack, n_world);
 }
 
 // ---------------------------------------------------------------------------
@@ -2293,8 +2561,8 @@ int StructBridgePlugin::apiImport(const std::string &name_or_path, std::string &
     fs::path file;
     std::string name;
     if (arg.find('/') != std::string::npos || arg.find('\\') != std::string::npos) {
-        file = fs::path(arg);
-        name = file.stem().string();
+        file = pathFromUtf8(arg);
+        name = pathToUtf8(file.stem());
     }
     else {
         name = arg;
@@ -2323,13 +2591,13 @@ int StructBridgePlugin::apiImport(const std::string &name_or_path, std::string &
         }
     }
     if (!fs::exists(file)) {
-        msg = "文件不存在: " + file.string();
+        msg = "文件不存在: " + pathToUtf8(file);
         return STAGE_API_NOT_FOUND;
     }
     std::ifstream in(file, std::ios::binary);
     std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     if (!nbt_check::validate(bytes, "format_version")) {
-        msg = "文件不是有效的 .mcstructure (NBT 校验失败，缺少 format_version): " + file.string();
+        msg = "文件不是有效的 .mcstructure (NBT 校验失败，缺少 format_version): " + pathToUtf8(file);
         return STAGE_IMPORT_PARSE;
     }
     int stage = STAGE_OK;
@@ -2347,7 +2615,7 @@ int StructBridgePlugin::apiImport(const std::string &name_or_path, std::string &
     writeStructureFile(libraryDir() / sanitizeRelativePath(name), bytes);
     writeStructureFile(packStructuresDir() / sanitizeRelativePath(name), bytes);
     msg = "导入成功: " + name + " (" + std::to_string(bytes.size()) + " 字节, key=" + key + ")";
-    getLogger().info("[api] Imported '{}' ({} bytes) from {}", name, bytes.size(), file.string());
+    getLogger().info("[api] Imported '{}' ({} bytes) from {}", name, bytes.size(), pathToUtf8(file));
     return STAGE_OK;
 }
 
@@ -2402,19 +2670,19 @@ int StructBridgePlugin::apiDump(const std::string &name, std::string &msg)
     {
         std::ofstream f(out_file, std::ios::binary);
         if (!f) {
-            msg = "无法写入文件: " + out_file.string();
+            msg = "无法写入文件: " + pathToUtf8(out_file);
             return STAGE_FILE;
         }
         f.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
         f.close();
         if (!f.good()) {
-            msg = "无法写入文件: " + out_file.string();
+            msg = "无法写入文件: " + pathToUtf8(out_file);
             return STAGE_FILE;
         }
     }
     writeStructureFile(packStructuresDir() / sanitizeRelativePath(clean), bytes);
-    msg = out_file.string();
-    getLogger().info("[api] Dumped '{}' ({} bytes) to {}", clean, bytes.size(), out_file.string());
+    msg = pathToUtf8(out_file);
+    getLogger().info("[api] Dumped '{}' ({} bytes) to {}", clean, bytes.size(), pathToUtf8(out_file));
     return STAGE_OK;
 }
 
@@ -2429,26 +2697,33 @@ int StructBridgePlugin::apiDelete(const char *name_or_null, std::string &msg)
     };
 
     if (name_or_null == nullptr) {
-        // Delete ALL plugin-managed structures.
+        // Delete ALL plugin-managed structures (exports library + own pack
+        // mirror only - behavior pack game data and world-only saves are not
+        // plugin-managed and stay).
         auto items = collectStructures();
-        if (items.empty()) {
-            msg = "结构库为空";
-            return STAGE_OK;
-        }
+        int structures = 0;
         int files = 0;
         for (const auto &item : items) {
+            if (!item.in_library && item.mirror.empty()) {
+                continue;
+            }
             dispatch_engine_delete(item.key);
-            for (const auto &f : {libraryDir() / item.ns / (item.local + ".mcstructure"),
-                                  libraryDir() / "default" / (item.local + ".mcstructure"),
-                                  packStructuresDir() / item.ns / (item.local + ".mcstructure")}) {
+            ++structures;
+            for (const auto &f : {libraryDir() / pathFromUtf8(item.ns) / pathFromUtf8(item.local + ".mcstructure"),
+                                  libraryDir() / "default" / pathFromUtf8(item.local + ".mcstructure"),
+                                  item.mirror}) {
                 std::error_code ec;
                 if (fs::exists(f, ec) && fs::remove(f, ec)) {
                     ++files;
                 }
             }
         }
-        msg = "已删除全部 " + std::to_string(items.size()) + " 个结构, 清理 " + std::to_string(files) + " 个文件";
-        getLogger().info("[api] Delete-all: {} structures, {} files", items.size(), files);
+        if (structures == 0) {
+            msg = "没有插件管理的结构可删除";
+            return STAGE_OK;
+        }
+        msg = "已删除全部 " + std::to_string(structures) + " 个结构, 清理 " + std::to_string(files) + " 个文件";
+        getLogger().info("[api] Delete-all: {} structures, {} files", structures, files);
         return STAGE_OK;
     }
 
@@ -2475,9 +2750,9 @@ int StructBridgePlugin::apiDelete(const char *name_or_null, std::string &msg)
     const std::string key = "mystructure:" + local;
     dispatch_engine_delete(key);
     std::vector<fs::path> files = {
-        libraryDir() / "mystructure" / (local + ".mcstructure"),
-        libraryDir() / "default" / (local + ".mcstructure"),
-        packStructuresDir() / "mystructure" / (local + ".mcstructure"),
+        libraryDir() / "mystructure" / pathFromUtf8(local + ".mcstructure"),
+        libraryDir() / "default" / pathFromUtf8(local + ".mcstructure"),
+        packStructuresDir() / "mystructure" / pathFromUtf8(local + ".mcstructure"),
     };
     int removed = 0;
     std::error_code ec;
@@ -2631,7 +2906,7 @@ void StructBridgePlugin::handleStatus(endstone::CommandSender &sender)
         sender.sendMessage("§7详情: {}", probe_detail_);
     }
     sender.sendMessage("§7Endstone: {} | Minecraft: {}", getServer().getVersion(), getServer().getMinecraftVersion());
-    sender.sendMessage("§7导出目录: {}", (getDataFolder() / config_.output_dir).string());
+    sender.sendMessage("§7导出目录: {}", pathToUtf8(getDataFolder() / config_.output_dir));
     sender.sendMessage("§7导出: 原版 structure save (引擎捕获) + 重试 {} 次 / 每 {} tick | 导入: 引擎虚 load 链路",
                        config_.export_max_attempts, config_.export_retry_interval_ticks);
     sender.sendMessage("§7进行中的导出任务: {}", export_jobs_.size());
@@ -2725,6 +3000,7 @@ public:
         std::string key;
         std::uint64_t size;
         bool loaded;
+        std::vector<std::string> sources;  // subset of {"library","pack","world"}
     };
     [[nodiscard]] std::vector<ListItem> listItems() const
     {
@@ -2736,8 +3012,20 @@ public:
             manager = StructBridgePlugin::getManager(plugin_->getServer(), stage);
         }
         for (const auto &item : items) {
-            out.push_back({item.key, static_cast<std::uint64_t>(item.size),
-                           manager != nullptr && manager->getStructure(item.key) != nullptr});
+            ListItem li;
+            li.key = item.key;
+            li.size = static_cast<std::uint64_t>(item.size);
+            li.loaded = manager != nullptr && manager->getStructure(item.key) != nullptr;
+            if (item.in_library) {
+                li.sources.emplace_back("library");
+            }
+            if (item.in_pack) {
+                li.sources.emplace_back("pack");
+            }
+            if (item.in_world) {
+                li.sources.emplace_back("world");
+            }
+            out.push_back(std::move(li));
         }
         return out;
     }
@@ -2929,10 +3217,25 @@ PyObject *list_structures(PyObject *, PyObject *)
         return nullptr;
     }
     for (std::size_t i = 0; i < items.size(); ++i) {
-        PyObject *d = Py_BuildValue("{s:s,s:K,s:O}", "key", items[i].key.c_str(), "size",
+        PyObject *sources = PyList_New(items[i].sources.size());
+        if (sources == nullptr) {
+            Py_DECREF(list);
+            return nullptr;
+        }
+        for (std::size_t j = 0; j < items[i].sources.size(); ++j) {
+            PyObject *s = PyUnicode_FromString(items[i].sources[j].c_str());
+            if (s == nullptr) {
+                Py_DECREF(sources);
+                Py_DECREF(list);
+                return nullptr;
+            }
+            PyList_SetItem(sources, static_cast<Py_ssize_t>(j), s);  // steals s
+        }
+        PyObject *d = Py_BuildValue("{s:s,s:K,s:O,s:N}", "key", items[i].key.c_str(), "size",
                                     static_cast<unsigned long long>(items[i].size), "loaded",
-                                    items[i].loaded ? Py_True : Py_False);
+                                    items[i].loaded ? Py_True : Py_False, "sources", sources);
         if (d == nullptr) {
+            Py_DECREF(sources);  // not stolen on failure
             Py_DECREF(list);
             return nullptr;
         }
@@ -3001,7 +3304,9 @@ PyMethodDef methods[] = {
     {"dump_structure", dump_structure, METH_VARARGS, "dump_structure(name) -> result dict."},
     {"delete_structure", delete_structure, METH_VARARGS,
      "delete_structure(name=None) -> result dict; None deletes all plugin-managed structures."},
-    {"list_structures", list_structures, METH_NOARGS, "list_structures() -> [ {key,size,loaded}, ... ]."},
+    {"list_structures", list_structures, METH_NOARGS,
+     "list_structures() -> [ {key,size,loaded,sources}, ... ]. sources: subset of "
+     "['library','pack','world'] (plugin exports / behavior packs / world database)."},
     {"export_region", reinterpret_cast<PyCFunction>(reinterpret_cast<void *>(export_region)),
      METH_VARARGS | METH_KEYWORDS,
      "export_region(name, x1,y1,z1, x2,y2,z2, dimension=None, include_entities=None, include_blocks=None, "
@@ -3055,7 +3360,7 @@ extern "C" STRUCTBRIDGE_EXPORT structbridge::IApi *structbridge_get_api(void)
     return structbridge::g_api_instance;
 }
 
-ENDSTONE_PLUGIN("structbridge", "0.0.1", structbridge::StructBridgePlugin)
+ENDSTONE_PLUGIN("structbridge", "0.0.2", structbridge::StructBridgePlugin)
 {
     description = "Server-side export/import of official .mcstructure files, with a crash-safe native probe.";
     website = "https://github.com/gxh6438/structbridge";

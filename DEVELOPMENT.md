@@ -79,6 +79,20 @@ pip install endstone==0.11.14
 
 `/structdump` 处理的结构可能只在磁盘上（引擎懒加载）。插件先派发一次 `structure load "<key>" 0 64 0 0_degrees none false true false 0.0`（integrity 0.0，不改动任何方块）把模板拉进内存，再走导出链的序列化部分。
 
+### 结构枚举（/structlist 三来源）
+
+引擎没有结构枚举 API（StructureManager 只有 getOrCreate/getStructure），`/structlist` 由插件自己合并三个来源，按引擎键去重：
+
+1. 插件结构库（`exports/` 目录，首个子目录即命名空间）；
+2. 各行为包的 `structures/` 目录（`structures/<ns>/<rest>.mcstructure` ⇔ 键 `<ns>:<rest>`）；`__brarchive/` 镜像目录与 `structures/` 平级，扫描天然不进入；行为包文件是只读游戏数据，只有插件自己写入 vanilla 包 `mystructure/` 的镜像可删；
+3. 世界 LevelDB（`worlds/<level-name>/db`，level-name 从 server.properties 读取）——`structuretemplate_` 前缀的键。扫描器在 `src/leveldb_scan.{h,cpp}`，独立编译单元、只依赖标准库，格式结论都记录在头文件注释里（块压缩类型 4 是 raw DEFLATE 而非 snappy、WAL 的 delete 条目不带 value、MANIFEST VersionEdit tag 6=deleted/7=new/9=prevlog 等，均在真实数据库上实证）。全部只读且 fail-soft：数据库归运行中的服务器所有，任何不一致只跳过对应文件或块。
+
+删除（`/structdelete` 批量模式与 API 的 delete-all）只处理插件管理的条目（结构库 + 自有镜像），行为包游戏数据与世界独有存档不动。
+
+### 名称与路径（UTF-8）
+
+引擎对结构名没有字符限制，LevelDB 按原始 UTF-8 存键（中文名实测可用）。插件的校验（`isValidStructureName`）接受一切合法 UTF-8 序列，拒绝控制字符、空格、引号、路径分隔符和第二个冒号；`sanitizeRelativePath` 原样保留多字节序列、只对小写 ASCII 折叠。Windows 上 `fs::path` 的窄字符转换走 ANSI 代码页会毁掉中文文件名，所有路径构造和显示统一经过 `pathFromUtf8`/`pathToUtf8`（内部走 UTF-16 宽 API）。
+
 ### 删除
 
 封装原版 `structure delete` 子命令（删引擎内存和 LevelDB 条目），再补删结构库和镜像两个文件。
@@ -109,6 +123,8 @@ Windows 版本目前不编入 Python 模块：交叉编译环境没有 Python �
 ## 已知的坑
 
 - libc++ 的 std::format 对 `char[N]` 按 N 个字符的区间格式化（含 NUL 和栈上垃圾），传参前包一层 `std::string`。
+- Windows 上 `fs::path` 的窄字符构造/`.string()` 走 ANSI 代码页，中文结构名必须经 `pathFromUtf8`/`pathToUtf8`（UTF-16 宽 API）转换。
+- 社区文档声称 Bedrock LevelDB 块压缩类型 4 是 snappy——实测是 raw DEFLATE（RFC 1951，无 zlib 头）。详见 `src/leveldb_scan.h` 注释。
 - Python 引用的 DECREF 必须在 GIL 区间内，dealloc 可能执行 Python 代码。
 - endstone 从 `plugins/.local/<名字>-<hash>.so` 加载插件副本，消费方 dlopen 原路径会得到第二个实例、API 指针为空。
 - Python 里导入插件基类用 `from endstone.plugin import Plugin`，`endstone.Plugin` 会因为 lazy_loader 报 AttributeError。

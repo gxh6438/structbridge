@@ -48,7 +48,8 @@
 //       result = structbridge.import_structure("myhouse")   # {"ok": ..., "stage": ..., "message": ...}
 //       structbridge.export_region("house", 0,63,0, 7,70,7,
 //                                  on_done=lambda stage, msg: print(stage, msg))
-//       for item in structbridge.list_structures(): print(item["key"], item["size"], item["loaded"])
+//       for item in structbridge.list_structures():
+//           print(item["key"], item["size"], item["loaded"], item["sources"])
 //
 // Stage codes are shared with the /structstatus diagnostics; human-readable
 // names via stageMessage() (C++) / stage_message() (Python).
@@ -113,8 +114,11 @@ public:
     // Returns a stage code; 0 = success.
     virtual int deleteStructure(const char* name_or_null, char* msg, unsigned long msg_cap) = 0;
 
-    // List plugin-managed structures. on_item fires once per structure on the
-    // calling thread. Returns the item count.
+    // List structures visible on this server: the plugin's exports library,
+    // every behavior pack's structures/ dir and the world database (LevelDB -
+    // structure block / "/structure save ... disk" entries, non-ASCII names
+    // included), merged and deduplicated by engine key. on_item fires once
+    // per structure on the calling thread. Returns the item count.
     virtual int listStructures(void (*on_item)(void* ctx, const char* key, std::uint64_t size_bytes,
                                                 int loaded_in_engine),
                                void* ctx) = 0;

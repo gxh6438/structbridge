@@ -16,6 +16,8 @@
 
 所有命令仅 OP 可用。
 
+结构名称支持中文等 UTF-8 字符（引擎本身没有限制，例如 `/structexport 中文屋 ...`），不允许空格、引号、路径分隔符和控制字符；命名空间冒号最多一个。
+
 ### /structexport
 
 ```
@@ -58,13 +60,19 @@
 /structdelete [名称]
 ```
 
-带名称时删除该结构的全部副本：引擎内存、世界数据库、结构库文件、行为包镜像，重启后也不会再出现。不带参数时删除全部结构。
+带名称时删除该结构的全部副本：引擎内存、世界数据库、结构库文件、行为包镜像，重启后也不会再出现，即使结构没加载也会从数据库清除。不带参数时批量删除插件管理的全部结构（结构库及其镜像）；玩家用结构块随手保存、从未经过本插件的世界存档结构不在管理范围内，不会被误删，需要单独 `/structdelete <名称>` 清理。
 
 只能删除 `mystructure:` 命名空间下的结构，行为包自带的结构不受影响。
 
 ### /structlist
 
-列出结构库中的全部结构，包括文件大小和是否已加载进引擎内存。
+列出服务器上能看到的所有结构，按三个来源合并去重：
+
+- **插件库** — `plugins/structbridge/exports/` 里本插件导出、导入过的结构
+- **行为包** — 各行为包自带的 `.mcstructure`（原版的要塞、村庄等）
+- **世界存档** — 玩家用结构块或 `/structure save ... disk` 保存的结构，直接读世界数据库得出，包括从未经过本插件的和中文名的
+
+每条记录标注来源（库/包/世界，可同时多处）、文件大小和是否已加载进引擎内存。行为包自带的结构属于游戏数据，不参与删除。
 
 ### /structprobe、/structstatus、/structapi
 
@@ -148,13 +156,13 @@ import structbridge
 if structbridge.is_available():
     structbridge.import_structure("myhouse")
     structbridge.dump_structure("123")
-    structbridge.list_structures()          # [{"key": ..., "size": ..., "loaded": ...}, ...]
+    structbridge.list_structures()          # [{"key": ..., "size": ..., "loaded": ..., "sources": [...]}, ...]
     structbridge.delete_structure("myhouse")
     structbridge.export_region("house", 100, 60, 100, 110, 70, 110,
                                on_done=lambda stage, msg: print(stage, msg))
 ```
 
-`is_available()` 在启动探测完成前为 `False`，调用方需要轮询等待。`export_region` 是异步的，回调在服务器线程触发；其余方法同步返回 `{"ok", "stage", "message"}` 字典。
+`is_available()` 在启动探测完成前为 `False`，调用方需要轮询等待。`export_region` 是异步的，回调在服务器线程触发；其余方法同步返回 `{"ok", "stage", "message"}` 字典。`list_structures` 的 `sources` 是来源列表，取值 `"library"`（插件库）、`"pack"`（行为包）、`"world"`（世界存档）。
 
 ### C++
 

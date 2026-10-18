@@ -9,8 +9,11 @@ Endstone 插件，在 Bedrock 专用服务器上导出、导入 `.mcstructure` �
 - `/structexport` — 把世界中的一块区域导出为 `.mcstructure` 文件
 - `/structimport` — 按名称或路径导入结构文件，重启服务器后依然可用
 - `/structdump` — 导出游戏内已保存的结构
-- `/structlist` / `/structdelete` — 查看和删除结构库
+- `/structlist` — 列出服务器上的全部结构（插件库、行为包、世界存档三来源合并）
+- `/structdelete` — 删除结构（引擎内存 + 世界数据库 + 插件文件）
 - 插件 API，供其他 Python / C++ 插件调用
+
+结构名称支持中文等 UTF-8 字符。
 
 ## 环境要求
 
