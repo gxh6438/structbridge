@@ -2353,8 +2353,8 @@ void StructBridgePlugin::handleDelete(endstone::CommandSender &sender, const std
     if (!checkPermission(sender)) {
         return;
     }
-    // No argument (or "all"): delete EVERY plugin-managed structure.
-    if (args.empty()) {
+    // No argument (or "全部"/"all"): delete EVERY plugin-managed structure.
+    if (args.empty() || args[0] == "全部" || args[0] == "all") {
         handleList(sender);  // show what is about to be deleted
         auto items = collectStructures();
         int structures = 0;
@@ -2391,14 +2391,14 @@ void StructBridgePlugin::handleDelete(endstone::CommandSender &sender, const std
     if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
         name = name.substr(1, name.size() - 2);
     }
-    if (name == "all") {
-        // same flow as no-arg, but reached explicitly
+    if (name == "全部" || name == "all") {
+        // same flow as no-arg, but reached explicitly (possibly quoted)
         std::vector<std::string> none;
         handleDelete(sender, none);
         return;
     }
     if (args.size() != 1) {
-        sender.sendMessage("§e用法: /structdelete [名称]  (带名称=删除该结构; 不带参数=删除全部)");
+        sender.sendMessage("§e用法: /structdelete [名称|全部]  (名称=删除该结构; 全部或不带参数=删除所有插件管理的结构)");
         return;
     }
     if (!isValidStructureName(name)) {
