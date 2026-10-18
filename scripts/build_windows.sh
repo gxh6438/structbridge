@@ -61,8 +61,8 @@ cat > "${GEN_INC}/RakNetTypes.h" <<'EOF'
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include <WinSock2.h>
+#include <WS2tcpip.h>
 #else
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -160,9 +160,11 @@ cd "${ROOT}"
     /X \
     -DENTT_SPARSE_PAGE=2048 \
     -DENTT_NO_MIXIN \
+    -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH \
     /I"${ROOT}/vendor" \
     /I"${ROOT}/vendor/entt" \
     /I"${ROOT}/src" \
+    /I"${ROOT}/include" \
     /I"${ENDSTONE_SRC}" \
     /I"${ENDSTONE_INC}" \
     /I"${GEN_INC}" \

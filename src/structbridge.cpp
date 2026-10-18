@@ -109,7 +109,7 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#include <windows.h>
+#include <Windows.h>  // canonical casing: SDK file is Windows.h (case-sensitive fs)
 #else
 #include <dlfcn.h>
 #include <signal.h>
