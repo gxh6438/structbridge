@@ -1,6 +1,7 @@
 #include "leveldb_scan.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -11,6 +12,77 @@
 
 namespace structbridge::ldb {
 namespace {
+
+// ---------------------------------------------------------------------------
+// CRC-32C (Castagnoli). LevelDB stores a masked CRC in every SSTable block
+// trailer ([data][1-byte type][4-byte masked crc32c(data||type)]) and every
+// WAL record header ([crc:4][len:2][type:1], crc = masked crc32c(type||
+// fragment)). Verifying them turns "corrupted but parseable" input into a
+// clean skip instead of a silently wrong result.
+// ---------------------------------------------------------------------------
+struct Crc32cTable {
+    std::uint32_t t[256] = {};
+    Crc32cTable()
+    {
+        for (std::uint32_t i = 0; i < 256; ++i) {
+            std::uint32_t c = i;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1) ? 0x82F63B78u ^ (c >> 1) : c >> 1;
+            }
+            t[i] = c;
+        }
+    }
+};
+
+const std::uint32_t *crc32cTable()
+{
+    static const Crc32cTable table;  // thread-safe magic static
+    return table.t;
+}
+
+std::uint32_t crc32c(const std::uint8_t *data, std::size_t n)
+{
+    const std::uint32_t *t = crc32cTable();
+    std::uint32_t c = 0xFFFFFFFFu;
+    for (std::size_t i = 0; i < n; ++i) {
+        c = t[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
+    }
+    return c ^ 0xFFFFFFFFu;
+}
+
+// LevelDB's mask: rotate right 15 bits and add a constant. Applied to both
+// SSTable block trailers and WAL record headers.
+std::uint32_t crc32cMask(std::uint32_t crc)
+{
+    return ((crc >> 15) | (crc << 17)) + 0xA282EAD8u;
+}
+
+// SSTable trailer check: raw points at [data(len)][type(1)][crc(4)].
+bool blockCrcOk(const std::uint8_t *raw, std::size_t len)
+{
+    if (len < 1) {
+        return false;
+    }
+    std::uint32_t stored = 0;
+    std::memcpy(&stored, raw + len + 1, 4);
+    return crc32cMask(crc32c(raw, len + 1)) == stored;  // covers data + type byte
+}
+
+// WAL record check: header [crc:4][len:2][type:1][payload(len)].
+// The stored CRC covers the type byte followed by the fragment payload.
+bool recordCrcOk(const std::uint8_t *header, const std::uint8_t *payload, std::uint16_t len)
+{
+    std::uint32_t stored = 0;
+    std::memcpy(&stored, header, 4);
+    const std::uint32_t *t = crc32cTable();
+    std::uint32_t c = 0xFFFFFFFFu;
+    c = t[(c ^ header[6]) & 0xFFu] ^ (c >> 8);  // type byte
+    for (std::uint16_t i = 0; i < len; ++i) {
+        c = t[(c ^ payload[i]) & 0xFFu] ^ (c >> 8);
+    }
+    c ^= 0xFFFFFFFFu;
+    return crc32cMask(c) == stored;
+}
 
 // ---------------------------------------------------------------------------
 // Raw DEFLATE decoder (RFC 1951). "puff"-style canonical Huffman decoding -
@@ -144,6 +216,11 @@ const short DIST_BASE[30] = {1,    2,    3,    4,    5,    7,    9,    13,   17,
 const short DIST_EXTRA[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4,  4,  5,  5,  6,
                               6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
 
+// Output cap for decompression: a legitimate Bedrock world block is at most
+// a few MB, so 64 MiB leaves a wide margin while bounding "decompression
+// bomb" inputs (corrupted or hostile streams) to a known worst case.
+constexpr std::size_t kInflateMaxOut = 64u * 1024 * 1024;
+
 bool inflateRaw(const std::uint8_t *data, std::size_t len, std::vector<std::uint8_t> &out)
 {
     // Fixed tables are cheap to build; rebuilding per call keeps this trivially
@@ -164,6 +241,9 @@ bool inflateRaw(const std::uint8_t *data, std::size_t len, std::vector<std::uint
 
     BitReader s{data, len};
     for (;;) {
+        if (out.size() > kInflateMaxOut) {
+            return false;  // decompression bomb / corrupted stream - refuse
+        }
         const int last = s.bit();
         if (!s.ok) {
             return false;
@@ -367,27 +447,40 @@ struct Reader {
 bool readFileRange(const std::filesystem::path &file, std::uint64_t offset, std::size_t size,
                    std::vector<std::uint8_t> &out)
 {
-    std::ifstream in(file, std::ios::binary);
-    if (!in) {
+    try {
+        std::ifstream in(file, std::ios::binary);
+        if (!in) {
+            return false;
+        }
+        in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        if (!in.good()) {
+            return false;
+        }
+        out.resize(size);
+        in.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(size));
+        return in.gcount() == static_cast<std::streamsize>(size);
+    }
+    catch (const std::exception &) {
+        // e.g. libstdc++ throws __ios_failure when the path resolves to a
+        // directory (a corrupted CURRENT can produce such a path via an
+        // embedded NUL). Never let a stream exception escape the scanner.
         return false;
     }
-    in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-    if (!in.good()) {
-        return false;
-    }
-    out.resize(size);
-    in.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(size));
-    return in.gcount() == static_cast<std::streamsize>(size);
 }
 
 bool readFileAll(const std::filesystem::path &file, std::vector<std::uint8_t> &out)
 {
-    std::ifstream in(file, std::ios::binary);
-    if (!in) {
+    try {
+        std::ifstream in(file, std::ios::binary);
+        if (!in) {
+            return false;
+        }
+        out.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        return !out.empty();
+    }
+    catch (const std::exception &) {
         return false;
     }
-    out.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    return !out.empty();
 }
 
 // ---------------------------------------------------------------------------
@@ -514,11 +607,17 @@ void noteEntry(std::map<std::string, KeyState> &merged, const std::string &inter
 bool scanTable(const std::filesystem::path &file, const std::string &prefix,
                std::map<std::string, KeyState> &merged)
 {
-    std::ifstream in(file, std::ios::binary | std::ios::ate);
-    if (!in) {
+    std::uint64_t file_size = 0;
+    try {
+        std::ifstream in(file, std::ios::binary | std::ios::ate);
+        if (!in) {
+            return false;
+        }
+        file_size = static_cast<std::uint64_t>(in.tellg());
+    }
+    catch (const std::exception &) {
         return false;
     }
-    const auto file_size = static_cast<std::uint64_t>(in.tellg());
     if (file_size < 48) {
         return false;
     }
@@ -540,6 +639,9 @@ bool scanTable(const std::filesystem::path &file, const std::string &prefix,
     std::vector<std::uint8_t> index_raw;
     if (!readFileRange(file, i_off, static_cast<std::size_t>(i_sz) + 5, index_raw)) {
         return false;
+    }
+    if (!blockCrcOk(index_raw.data(), static_cast<std::size_t>(i_sz))) {
+        return false;  // corrupted index block - cannot trust this table
     }
     std::vector<std::uint8_t> scratch;
     std::vector<BlockEntry> index_entries;
@@ -570,6 +672,9 @@ bool scanTable(const std::filesystem::path &file, const std::string &prefix,
         std::vector<std::uint8_t> block_raw;
         if (!readFileRange(file, b_off, static_cast<std::size_t>(b_sz) + 5, block_raw)) {
             return false;
+        }
+        if (!blockCrcOk(block_raw.data(), static_cast<std::size_t>(b_sz))) {
+            continue;  // corrupted block - fail soft
         }
         std::vector<std::uint8_t> block_scratch;
         std::vector<BlockEntry> block_entries;
@@ -611,10 +716,18 @@ bool forEachLogRecord(const std::vector<std::uint8_t> &data,
         std::memcpy(&crc, data.data() + pos, 4);
         std::memcpy(&length, data.data() + pos + 4, 2);
         type = data[pos + 6];
-        pos += 7;
-        if (length == 0 || pos + length > data.size()) {
+        if (length == 0 || pos + 7 + length > data.size()) {
             break;  // truncated tail (mid-write) - ignore
         }
+        // CRC guard: a record whose CRC does not verify is either mid-write
+        // or corrupted. Dropping it (and any pending FIRST/MIDDLE chain)
+        // prevents silently misparsed batches from reaching the merge map.
+        if (!recordCrcOk(data.data() + pos, data.data() + pos + 7, length)) {
+            pending.clear();
+            pos += BLOCK - (pos % BLOCK);  // resync at next block boundary
+            continue;
+        }
+        pos += 7;
         const std::uint8_t *payload = data.data() + pos;
         pos += length;
         switch (type) {
@@ -700,6 +813,25 @@ void applyWriteBatch(const std::uint8_t *p, std::size_t n, const std::string &pr
     }
 }
 
+// Shared tail of scanStructures: report keys whose latest write is a put.
+std::vector<WorldStructure> finalizeMerged(const std::map<std::string, KeyState> &merged,
+                                           const std::string &prefix)
+{
+    std::vector<WorldStructure> result;
+    for (const auto &kv : merged) {
+        if (!kv.second.put) {
+            continue;
+        }
+        WorldStructure ws;
+        ws.key = kv.first.substr(prefix.size());
+        ws.size = kv.second.value_size;
+        if (!ws.key.empty()) {
+            result.push_back(std::move(ws));
+        }
+    }
+    return result;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -707,11 +839,17 @@ void applyWriteBatch(const std::uint8_t *p, std::size_t n, const std::string &pr
 // ---------------------------------------------------------------------------
 std::vector<WorldStructure> scanStructures(const std::filesystem::path &db_dir)
 {
-    std::vector<WorldStructure> result;
     namespace fs = std::filesystem;
     std::error_code ec;
+
+    // Total time fuse: this runs on the server thread against a database the
+    // live server owns. A healthy world scans in well under a second; if we
+    // ever blow past the budget (pathological FS, hostile input) stop early
+    // with whatever was collected instead of stalling the tick loop.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    auto outOfTime = [&deadline] { return std::chrono::steady_clock::now() > deadline; };
     if (!fs::exists(db_dir, ec) || !fs::is_directory(db_dir, ec)) {
-        return result;
+        return {};
     }
     const std::string prefix = "structuretemplate_";
     std::map<std::string, KeyState> merged;
@@ -823,6 +961,9 @@ std::vector<WorldStructure> scanStructures(const std::filesystem::path &db_dir)
     // ---- 2) Scan live SSTables (or every table if the MANIFEST was unusable) ----
     if (manifest_ok) {
         for (auto num : live_tables) {
+            if (outOfTime()) {
+                return finalizeMerged(merged, prefix);
+            }
             char name[32];
             std::snprintf(name, sizeof(name), "%06llu.ldb", static_cast<unsigned long long>(num));
             if (fs::exists(db_dir / name, ec)) {
@@ -837,6 +978,9 @@ std::vector<WorldStructure> scanStructures(const std::filesystem::path &db_dir)
     }
     else {
         for (fs::directory_iterator it(db_dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+            if (outOfTime()) {
+                return finalizeMerged(merged, prefix);
+            }
             const auto ext = it->path().extension().string();
             if (ext == ".ldb" || ext == ".sst") {
                 scanTable(it->path(), prefix, merged);
@@ -847,6 +991,9 @@ std::vector<WorldStructure> scanStructures(const std::filesystem::path &db_dir)
     // ---- 3) Apply the write-ahead logs (all of them; sequence numbers dedupe) ----
     {
         for (fs::directory_iterator it(db_dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+            if (outOfTime()) {
+                return finalizeMerged(merged, prefix);
+            }
             if (it->path().extension().string() != ".log") {
                 continue;
             }
@@ -861,18 +1008,7 @@ std::vector<WorldStructure> scanStructures(const std::filesystem::path &db_dir)
     }
 
     // ---- 4) Report keys whose latest write is a put ----
-    for (const auto &kv : merged) {
-        if (!kv.second.put) {
-            continue;
-        }
-        WorldStructure ws;
-        ws.key = kv.first.substr(prefix.size());
-        ws.size = kv.second.value_size;
-        if (!ws.key.empty()) {
-            result.push_back(std::move(ws));
-        }
-    }
-    return result;
+    return finalizeMerged(merged, prefix);
 }
 
 }  // namespace structbridge::ldb

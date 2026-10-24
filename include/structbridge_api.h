@@ -27,7 +27,11 @@
 //   if (!h) { /* structbridge is not installed */ }
 //   auto ver = (structbridge_api_version_fn)dlsym(h, "structbridge_api_version");
 //   auto get = (structbridge_get_api_fn)dlsym(h, "structbridge_get_api");
-//   if (!get || ver() != STRUCTBRIDGE_API_VERSION) { /* version mismatch */ }
+//   // Version check: v2 APPENDED methods after the v1 vtable prefix, so a
+//   // server exporting v2 still serves v1-compiled callers; check
+//   // "ver() >= STRUCTBRIDGE_API_VERSION you compiled with" (and guard the
+//   // v2-only methods with ver() >= 2).
+//   if (!get || ver() < STRUCTBRIDGE_API_VERSION) { /* version mismatch */ }
 //   structbridge::IApi* api = (structbridge::IApi*)get();
 //   if (!api->isAvailable()) { /* probe failed on this server build */ }
 //
@@ -40,6 +44,13 @@
 //                     [](void* ctx, int stage, const char* msg) {
 //                         // stage == 0 -> msg is the exported file path
 //                     }, nullptr);
+//
+//   // v2: dimensioned export with a custom output dir (the named player is
+//   // the ONLY one ever teleported) and bundle-aware placement
+//   api->exportRegionTo("castle", 0,64,0, 1023,120,1023, "overworld", true, true,
+//                       "backups/october", "Steve", true, on_done, nullptr);
+//   api->placeStructure("castle", 0, 64, 0, true, nullptr, true, true, "Steve",
+//                       on_done, nullptr);  // original position + dimension
 //
 // Python usage (any Python plugin, in onEnable or later):
 //
@@ -68,7 +79,7 @@
 #define STRUCTBRIDGE_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define STRUCTBRIDGE_API_VERSION 1u
+#define STRUCTBRIDGE_API_VERSION 2u
 
 namespace structbridge {
 
@@ -81,10 +92,12 @@ public:
     // True once the startup compatibility probe passed (fork-sandbox roundtrip
     // of the full native chain on this server build).
     [[nodiscard]] virtual bool isAvailable() const = 0;
-    // Plugin version string, e.g. "0.0.1".
+    // Plugin version string, e.g. "0.1.0".
     [[nodiscard]] virtual const char* version() const = 0;
     // Human-readable stage name for a stage code.
     [[nodiscard]] virtual const char* stageMessage(int stage) const = 0;
+
+    // ---- v1 surface (unchanged; v1-compiled consumers keep working) ----
 
     // Export a world region as .mcstructure (engine-native serialization,
     // identical to a structure block export). Asynchronous: chunks are
@@ -95,7 +108,7 @@ public:
     // the written file path.
     //
     // dimension: v1 supports "overworld" (or nullptr). Player-dimension
-    // exports stay available through the /structexport command.
+    // exports stay available through the /struct export command.
     virtual std::uint64_t exportRegion(const char* name, int x1, int y1, int z1, int x2, int y2, int z2,
                                        const char* dimension, bool include_entities, bool include_blocks,
                                        void (*on_done)(void* ctx, int stage, const char* message), void* ctx) = 0;
@@ -122,6 +135,54 @@ public:
     virtual int listStructures(void (*on_item)(void* ctx, const char* key, std::uint64_t size_bytes,
                                                 int loaded_in_engine),
                                void* ctx) = 0;
+
+    // ---- v2 surface (APPENDED: the vtable prefix is unchanged, so v1
+    // consumers remain binary compatible) ----
+
+    // v2 export: adds a custom output directory, an explicit TP player and
+    // bundle control.
+    //
+    // out_dir: nullptr/"" = the plugin library (like v1 exportRegion);
+    // otherwise a custom directory (absolute, or relative to the server
+    // root) that receives the .mcstructure - or, for bundles, a
+    // <out_dir>/<name>.bundle directory with tiles + manifest.json.
+    //
+    // tp_player: the ONLY player this job may teleport to help load chunks
+    // (tickingarea budget shortfall or nether/end exports, which need a
+    // player origin). REQUIRED for non-overworld dimensions (nullptr is
+    // rejected there). Never a random player - whoever the caller names.
+    //
+    // force_bundle: also tile small regions into a .bundle (manifest.json
+    // records the original region + dimension). Regions larger than 64x64 in
+    // X/Z are ALWAYS bundles (the engine's per-template limit is 64x384x64);
+    // Y spans over 384 are rejected.
+    virtual std::uint64_t exportRegionTo(const char* name, int x1, int y1, int z1, int x2, int y2, int z2,
+                                         const char* dimension, bool include_entities, bool include_blocks,
+                                         const char* out_dir, const char* tp_player, bool force_bundle,
+                                         void (*on_done)(void* ctx, int stage, const char* message), void* ctx) = 0;
+
+    // v2 place: load a structure (or a whole bundle) into the world at (x,y,z)
+    // - the missing half of the roundtrip. Chunks at the TARGET are loaded
+    // the same way exports do (tickingareas + tp_player assist).
+    //
+    // name: a structure name, a library bundle name, or a .bundle DIRECTORY
+    // path (relative to the server root, or absolute) - the latter covers
+    // bundles exported to a custom out_dir through exportRegionTo.
+    //
+    // original=true restores a BUNDLE at its exported position/dimension
+    // (cross-server building migration); single structures reject it (a
+    // bare .mcstructure carries no world position).
+    //
+    // dimension: "overworld" (default) / "nether" / "the_end".
+    // tp_player: as in exportRegionTo - REQUIRED for non-overworld targets.
+    //
+    // The structure must exist in the engine memory, the plugin library, a
+    // behavior pack or the world database; bundles are looked up in the
+    // library. Returns a job id > 0, or 0 on immediate rejection.
+    virtual std::uint64_t placeStructure(const char* name, int x, int y, int z, bool original,
+                                         const char* dimension, bool include_entities, bool include_blocks,
+                                         const char* tp_player,
+                                         void (*on_done)(void* ctx, int stage, const char* message), void* ctx) = 0;
 };
 
 }  // namespace structbridge
