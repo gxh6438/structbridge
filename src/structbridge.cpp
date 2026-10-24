@@ -47,11 +47,6 @@
 // Commands are registered through the plugin description; the native Level
 // handle is reached via direct member access; the bedrock-shim constructors
 // that header code instantiates are defined locally below.
-//
-// Safety gate: at startup the plugin PROBES the whole chain (export AND the
-// full import roundtrip) inside a fork() sandbox on Linux; a crash in the
-// child disables the feature, the server is never at risk. On Windows the gate
-// stays closed unless explicitly enabled in the config.
 
 #include <algorithm>
 #include <cctype>
@@ -113,9 +108,6 @@
 #include <Windows.h>  // canonical casing: SDK file is Windows.h (case-sensitive fs)
 #else
 #include <dlfcn.h>
-#include <signal.h>
-#include <sys/wait.h>
-#include <unistd.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -155,8 +147,8 @@ BaseGameVersion::BaseGameVersion() = default;
 //   IStructureTemplateManager : Bedrock::EnableNonOwnerReferences
 //     (dtor only), then getOrCreateJigsawStructureMetadata, getOrCreate,
 //     getStructure, getOrCreateLegacy, readStructure
-// The save()/getStructure()/getOrCreate() slots have been verified live via the
-// fork-sandbox probe; load() sits directly before save() in both shims.
+// The save()/getStructure()/getOrCreate() slots have been verified against the
+// live BDS 1.26.52 runtime; load() sits directly before save() in both shims.
 //
 // NOTE: "StructureManager" intentionally completes the forward declaration that
 // Endstone's own headers already make (bedrock/forward.h); the class below only
@@ -494,7 +486,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Minimal little-endian NBT validator (used to verify probe/export output and
+// Minimal little-endian NBT validator (used to verify export output and
 // to sanity-check files before import).
 // ---------------------------------------------------------------------------
 namespace nbt_check {
@@ -681,21 +673,10 @@ bool validate(const std::vector<std::uint8_t> &data, const std::string &required
 namespace structbridge {
 
 struct Config {
-    int version = 3;
-    // Canonical structure store (was "exports" pre-0.1.0; auto-migrated).
     std::string library_dir = "library";
-    // Legacy key kept only so existing config.json files can be migrated.
-    std::string output_dir_legacy;
     bool include_entities = true;
     bool include_blocks = true;
-    bool probe_enabled = true;
-    int probe_timeout_seconds = 15;
-    std::string probe_template_name = "structbridge:__probe__";
     bool require_op = true;
-    // Windows has no fork sandbox; the native gate stays closed unless explicitly allowed.
-    bool windows_allow_without_probe = false;
-    std::string windows_expected_minecraft_version;  // empty = any
-    bool diagnostic_logging = true;
     // Export retry behaviour: the region's chunks are force-loaded with named
     // tickingareas and the vanilla save command is re-dispatched until the
     // template appears (or the attempt budget is spent).
@@ -705,10 +686,8 @@ struct Config {
     int export_max_areas = 10;             // BDS global tickingarea limit
 };
 
-enum class GateState { NotProbed, Available, Unavailable };
-
-// Probe exit codes (also used as failure reasons).
-enum ProbeStage : int {
+// Stage codes (shared by the API callbacks and /struct api diagnostics).
+enum Stage : int {
     STAGE_OK = 0,
     STAGE_NO_LEVEL = 10,
     STAGE_MANAGER = 11,
@@ -717,18 +696,15 @@ enum ProbeStage : int {
     STAGE_WRITE = 14,
     STAGE_PARSE = 15,
     STAGE_FILE = 16,
-    STAGE_NBT_READ = 18,
     STAGE_IMPORT_PARSE = 20,
     STAGE_TEMPLATE_LOAD = 21,
-    STAGE_IMPORT_MISMATCH = 22,
     // API-only rejection reasons (never produced by the native chain itself).
     STAGE_API_ARG = 30,
     STAGE_API_SIZE = 31,
     STAGE_API_DIM = 32,
-    STAGE_API_GATE = 33,
     STAGE_API_NOT_FOUND = 34,
     STAGE_API_TIMEOUT = 35,
-    // v0.1 placement / bundle stages.
+    // Placement / bundle stages.
     STAGE_PLACE_AREA = 40,       // could not load the target chunks (areas + TP)
     STAGE_PLACE_LOAD = 41,       // vanilla structure load did not take effect
     STAGE_BUNDLE_MANIFEST = 42,  // manifest missing / unreadable / inconsistent
@@ -747,14 +723,11 @@ const char *stageName(int stage)
         case STAGE_WRITE: return "nbt-write";
         case STAGE_PARSE: return "nbt-parse";
         case STAGE_FILE: return "file-write";
-        case STAGE_NBT_READ: return "nbt-read-back";
         case STAGE_IMPORT_PARSE: return "import-nbt-parse";
         case STAGE_TEMPLATE_LOAD: return "template-load";
-        case STAGE_IMPORT_MISMATCH: return "import-roundtrip-mismatch";
         case STAGE_API_ARG: return "invalid-name-or-argument";
         case STAGE_API_SIZE: return "region-too-large";
         case STAGE_API_DIM: return "unsupported-dimension";
-        case STAGE_API_GATE: return "probe-gate-closed";
         case STAGE_API_NOT_FOUND: return "not-found";
         case STAGE_API_TIMEOUT: return "export-retry-budget-exhausted";
         case STAGE_PLACE_AREA: return "place-chunk-load";
@@ -762,7 +735,7 @@ const char *stageName(int stage)
         case STAGE_BUNDLE_MANIFEST: return "bundle-manifest";
         case STAGE_BUNDLE_TILE: return "bundle-tile-export";
         case STAGE_API_NO_PLAYER: return "tp-player-unavailable";
-        default: return "crashed-or-signal";
+        default: return "unknown-stage";
     }
 }
 
@@ -814,6 +787,15 @@ struct BundleManifest {
     }
 };
 
+// The pre-teleport position of a job's designated player, recorded before the
+// FIRST teleport and restored when the job finishes (success, failure or
+// abort) - the player is only ever moved to load chunks, never left behind.
+struct TpReturn {
+    bool valid = false;
+    std::string dimension;
+    float x = 0.0F, y = 0.0F, z = 0.0F, pitch = 0.0F, yaw = 0.0F;
+};
+
 // One in-flight /structexport request (also used by the API's exportRegion).
 struct ExportJob {
     std::string name;
@@ -826,7 +808,9 @@ struct ExportJob {
     // player who initiated the command (or an explicit API parameter) -
     // NEVER a random online player.
     std::string tp_player_name;
-    // v0.1: custom output directory (API exportRegionTo). Empty = library.
+    // recorded before the first teleport, restored when the job finishes
+    TpReturn tp_return;
+    // custom output directory (API). Empty = library.
     fs::path out_dir;
     // v0.1: bundle directory override (out_dir/<name>.bundle). Empty = the
     // canonical library location library/mystructure/<name>.bundle.
@@ -857,6 +841,7 @@ struct PlaceJob {
     bool entities = true;
     bool blocks = true;
     std::string tp_player_name;  // may be teleported to load target chunks
+    TpReturn tp_return;          // recorded before the first teleport, restored on finish
     std::shared_ptr<BundleManifest> bundle;  // null for single structures
     std::size_t tile_index = 0;
     int attempts = 0;
@@ -895,8 +880,7 @@ public:
                    const std::vector<std::string> &args) override;
 
 private:
-    // Command handlers (the unified /struct command dispatches into these;
-    // the legacy /structxxx commands alias them for one transition release).
+    // Command handlers, dispatched by the unified /struct command.
     void handleExport(endstone::CommandSender &sender, const std::vector<std::string> &args);
     void handleImport(endstone::CommandSender &sender, const std::vector<std::string> &args);
     void handleDump(endstone::CommandSender &sender, const std::vector<std::string> &args);
@@ -904,8 +888,7 @@ private:
     void handleClear(endstone::CommandSender &sender, const std::vector<std::string> &args);
     void handleList(endstone::CommandSender &sender, const std::vector<std::string> &args);
     void handlePlace(endstone::CommandSender &sender, const std::vector<std::string> &args);
-    void handleProbe(endstone::CommandSender &sender);
-    void handleStatus(endstone::CommandSender &sender, bool rerun_probe);
+    void handleStatus(endstone::CommandSender &sender);
     void handleApiSelfTest(endstone::CommandSender &sender);
 
     // ---- Public API core (structured stage results, independent of any
@@ -915,15 +898,10 @@ private:
     int apiDump(const std::string &name, std::string &msg);
     int apiDelete(const char *name_or_null, std::string &msg);  // null = delete all
     std::uint64_t apiExportRegion(const std::string &name, int x1, int y1, int z1, int x2, int y2, int z2,
-                                  const char *dimension, bool entities, bool blocks,
+                                  const char *dimension, bool entities, bool blocks, const char *out_dir,
+                                  const char *tp_player, bool force_bundle,
                                   void (*on_done)(void *ctx, int stage, const char *message), void *ctx,
                                   void *py_on_done);
-    // v2: adds custom output dir, explicit TP player and bundle support.
-    std::uint64_t apiExportRegionTo(const std::string &name, int x1, int y1, int z1, int x2, int y2, int z2,
-                                    const char *dimension, bool entities, bool blocks, const char *out_dir,
-                                    const char *tp_player, bool force_bundle,
-                                    void (*on_done)(void *ctx, int stage, const char *message), void *ctx,
-                                    void *py_on_done);
     std::uint64_t apiPlaceStructure(const std::string &name, int x, int y, int z, bool original,
                                     const char *dimension, bool entities, bool blocks, const char *tp_player,
                                     void (*on_done)(void *ctx, int stage, const char *message), void *ctx,
@@ -980,11 +958,9 @@ private:
     // exported to a custom out_dir. Returns nullptr when not found.
     [[nodiscard]] std::shared_ptr<BundleManifest> resolveBundleRef(const std::string &name) const;
 
-    // Native chain helpers (run in both parent and probe child)
+    // Native chain helpers
     static StructureManager *getManager(endstone::Server &server, int &stage);
-    static bool buildMcstructureBytes(StructureTemplate *tpl, std::vector<std::uint8_t> &out, int &stage,
-                                      std::vector<std::uint8_t> *raw_out = nullptr,
-                                      bool require_format_version = true);
+    static bool buildMcstructureBytes(StructureTemplate *tpl, std::vector<std::uint8_t> &out, int &stage);
     static int importMcstructureBytes(StructureManager *manager, const std::string &key,
                                       const std::vector<std::uint8_t> &bytes);
 
@@ -1017,30 +993,22 @@ private:
     void startPlaceJob(std::shared_ptr<PlaceJob> job);
     [[nodiscard]] static std::string normalizeDimension(std::string dim);  // "" -> "overworld"
 
-    // Layout migration (pre-0.1.0 -> library layout)
-    void migrateLegacyLayout();
+    // Teleport bookkeeping: restore the designated player to where they were
+    // before the job first moved them (no-op when they were never moved or
+    // already left).
+    void restoreTeleportedPlayer(const std::string &player_name, const TpReturn &ret);
 
     // <server root> derived from the (absolute) plugin data folder.
     [[nodiscard]] fs::path serverRoot() const;
 
-    // Probe
-    void startProbeWhenReady();
-    void runProbe(bool manual);
-#if !defined(_WIN32)
-    static int probeChildMain(endstone::Server &server, const Config &config, const fs::path &out_file);
-#endif
-    bool evaluateWindowsGate();
-
     Config config_;
-    GateState gate_ = GateState::NotProbed;
-    int probe_stage_ = -1;
-    std::string probe_detail_;
-    bool probe_scheduled_ = false;
-    int probe_attempts_ = 0;
-    std::shared_ptr<endstone::Task> probe_task_;
-
     std::vector<std::shared_ptr<ExportJob>> export_jobs_;
     std::vector<std::shared_ptr<PlaceJob>> place_jobs_;
+    // Jobs accepted through the API before this plugin was enabled: the
+    // Endstone scheduler silently drops tasks registered by a disabled
+    // plugin, so their timers only start in onEnable().
+    std::vector<std::shared_ptr<ExportJob>> pending_export_jobs_;
+    std::vector<std::shared_ptr<PlaceJob>> pending_place_jobs_;
     int area_counter_ = 0;
     std::uint64_t api_job_counter_ = 0;
     // /struct clear confirmation window (server-wide, 60 s).
@@ -1058,7 +1026,7 @@ private:
 class ApiImpl;
 ApiImpl *g_api_instance = nullptr;               // created in onLoad, alive for the process
 ApiImpl *createApiImpl(StructBridgePlugin *plugin);  // defined next to ApiImpl
-constexpr const char *kPluginVersion = "0.1.0";  // twin of the ENDSTONE_PLUGIN version string
+constexpr const char *kPluginVersion = "0.1.1";  // twin of the ENDSTONE_PLUGIN version string
 
 // ---------------------------------------------------------------------------
 // Config
@@ -1069,17 +1037,10 @@ void StructBridgePlugin::saveDefaultConfig()
     std::error_code ec;
     fs::create_directories(dir, ec);
     json j;
-    j["version"] = config_.version;
     j["library_dir"] = config_.library_dir;
     j["include_entities"] = config_.include_entities;
     j["include_blocks"] = config_.include_blocks;
-    j["probe_enabled"] = config_.probe_enabled;
-    j["probe_timeout_seconds"] = config_.probe_timeout_seconds;
-    j["probe_template_name"] = config_.probe_template_name;
     j["require_op"] = config_.require_op;
-    j["windows_allow_without_probe"] = config_.windows_allow_without_probe;
-    j["windows_expected_minecraft_version"] = config_.windows_expected_minecraft_version;
-    j["diagnostic_logging"] = config_.diagnostic_logging;
     j["export_max_attempts"] = config_.export_max_attempts;
     j["export_retry_interval_ticks"] = config_.export_retry_interval_ticks;
     j["export_area_chunk_limit"] = config_.export_area_chunk_limit;
@@ -1106,20 +1067,10 @@ void StructBridgePlugin::loadConfig()
         auto get_str = [&j](const char *k, const std::string &d) {
             return j.contains(k) && j[k].is_string() ? j[k].get<std::string>() : d;
         };
-        config_.version = get_int("version", 3);
         config_.library_dir = get_str("library_dir", "library");
-        // Legacy "output_dir" (pre-0.1.0) - remembered for the one-time
-        // directory migration in onEnable().
-        config_.output_dir_legacy = get_str("output_dir", "");
         config_.include_entities = get_bool("include_entities", true);
         config_.include_blocks = get_bool("include_blocks", true);
-        config_.probe_enabled = get_bool("probe_enabled", true);
-        config_.probe_timeout_seconds = std::clamp(get_int("probe_timeout_seconds", 15), 3, 120);
-        config_.probe_template_name = get_str("probe_template_name", "structbridge:__probe__");
         config_.require_op = get_bool("require_op", true);
-        config_.windows_allow_without_probe = get_bool("windows_allow_without_probe", false);
-        config_.windows_expected_minecraft_version = get_str("windows_expected_minecraft_version", "");
-        config_.diagnostic_logging = get_bool("diagnostic_logging", true);
         config_.export_max_attempts = std::clamp(get_int("export_max_attempts", 20), 1, 600);
         config_.export_retry_interval_ticks = std::clamp(get_int("export_retry_interval_ticks", 20), 1, 200);
         config_.export_area_chunk_limit = std::clamp(get_int("export_area_chunk_limit", 100), 1, 100);
@@ -1151,9 +1102,7 @@ StructureManager *StructBridgePlugin::getManager(endstone::Server &server, int &
     return manager;
 }
 
-bool StructBridgePlugin::buildMcstructureBytes(StructureTemplate *tpl, std::vector<std::uint8_t> &out,
-                                               int &stage, std::vector<std::uint8_t> *raw_out,
-                                               bool require_format_version)
+bool StructBridgePlugin::buildMcstructureBytes(StructureTemplate *tpl, std::vector<std::uint8_t> &out, int &stage)
 {
     auto tag = tpl->save();
     if (!tag) {
@@ -1165,19 +1114,11 @@ bool StructBridgePlugin::buildMcstructureBytes(StructureTemplate *tpl, std::vect
     sink.appendRaw16(0x0000);   // root name: empty (vanilla .mcstructure layout)
     tag->write(sink);           // payload via native vtable dispatch
     auto data = sink.takeData();
-    if (raw_out != nullptr) {
-        *raw_out = data;  // always expose the raw bytes for diagnosis
-    }
     if (data.size() < 4) {
         stage = STAGE_WRITE;
         return false;
     }
-    // For real exports the file must contain format_version. The startup probe
-    // serializes an EMPTY template (no vanilla command involved - see
-    // probeChildMain), whose payload may legitimately lack the key, so there we
-    // only require structurally valid NBT.
-    if (require_format_version ? !nbt_check::validate(data, "format_version")
-                               : !nbt_check::validate(data, "")) {
+    if (!nbt_check::validate(data, "format_version")) {
         stage = STAGE_PARSE;
         return false;
     }
@@ -1188,7 +1129,7 @@ bool StructBridgePlugin::buildMcstructureBytes(StructureTemplate *tpl, std::vect
 // Imports raw .mcstructure bytes into the structure manager under `key`.
 // The engine's own NBT parser (virtual Tag::load) consumes the bytes through
 // our MemoryDataInput; the plugin never builds NBT by hand. Returns STAGE_OK
-// (0) on success or a ProbeStage error code.
+// (0) on success or a Stage error code.
 int StructBridgePlugin::importMcstructureBytes(StructureManager *manager, const std::string &key,
                                                const std::vector<std::uint8_t> &bytes)
 {
@@ -1214,251 +1155,6 @@ int StructBridgePlugin::importMcstructureBytes(StructureManager *manager, const 
         return STAGE_TEMPLATE_LOAD;
     }
     return STAGE_OK;
-}
-
-// ---------------------------------------------------------------------------
-// Probe
-// ---------------------------------------------------------------------------
-#if !defined(_WIN32)
-int StructBridgePlugin::probeChildMain(endstone::Server &server, const Config &config, const fs::path &out_file)
-{
-    alarm(static_cast<unsigned>(config.probe_timeout_seconds));  // watchdog: kill child on hang
-
-    int stage = STAGE_OK;
-    auto *manager = getManager(server, stage);
-    if (manager == nullptr) {
-        _exit(stage);
-    }
-
-    // A) EXPORT chain: serialize a template (existing one if a previous run
-    //    left it, otherwise an empty one from getOrCreate) and write the file.
-    auto *tpl = manager->getStructure(config.probe_template_name);
-    if (tpl == nullptr) {
-        tpl = &manager->getOrCreate(config.probe_template_name);
-    }
-    std::vector<std::uint8_t> bytes_a;
-    if (!buildMcstructureBytes(tpl, bytes_a, stage, nullptr, /*require_format_version=*/false)) {
-        _exit(stage);
-    }
-    {
-        std::ofstream f(out_file, std::ios::binary);
-        if (!f) {
-            _exit(STAGE_FILE);
-        }
-        f.write(reinterpret_cast<const char *>(bytes_a.data()),
-                static_cast<std::streamsize>(bytes_a.size()));
-        f.flush();
-        if (!f.good()) {
-            _exit(STAGE_FILE);
-        }
-    }
-
-    // B) IMPORT chain: read the file back and drive it through the full
-    //    virtual-load route (Tag::load -> StructureTemplate::load), then
-    //    re-serialize and require a byte-identical roundtrip.
-    std::vector<std::uint8_t> bytes_b;
-    {
-        std::ifstream in(out_file, std::ios::binary);
-        bytes_b.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    }
-    if (bytes_b != bytes_a || bytes_b.empty()) {
-        _exit(STAGE_NBT_READ);
-    }
-    {
-        auto &tpl2 = manager->getOrCreate(config.probe_template_name + "_import");
-        auto tag2 = tpl2.save();
-        if (!tag2) {
-            _exit(STAGE_SAVE);
-        }
-        MemoryDataInput input(bytes_b);
-        if (!input.skipStructureHeader()) {
-            _exit(STAGE_IMPORT_PARSE);
-        }
-        auto result = tag2->load(input);
-        if (!result.ignoreError()) {
-            _exit(STAGE_IMPORT_PARSE);
-        }
-        if (input.numBytesLeft() != 0) {
-            _exit(STAGE_IMPORT_PARSE);
-        }
-        if (!tpl2.vslot_load(*static_cast<CompoundTag *>(tag2.get()))) {
-            _exit(STAGE_TEMPLATE_LOAD);
-        }
-        std::vector<std::uint8_t> bytes_c;
-        int stage_c = STAGE_OK;
-        if (!buildMcstructureBytes(&tpl2, bytes_c, stage_c, nullptr, false)) {
-            _exit(stage_c);
-        }
-        if (bytes_c != bytes_a) {
-            // Dump the roundtrip output so the mismatch can be inspected.
-            std::ofstream dbg(out_file.string() + ".roundtrip.bin", std::ios::binary);
-            if (dbg) {
-                dbg.write(reinterpret_cast<const char *>(bytes_c.data()),
-                          static_cast<std::streamsize>(bytes_c.size()));
-            }
-            _exit(STAGE_IMPORT_MISMATCH);
-        }
-    }
-
-    _exit(STAGE_OK);
-}
-#endif
-
-bool StructBridgePlugin::evaluateWindowsGate()
-{
-#if defined(_WIN32)
-    if (!config_.windows_allow_without_probe) {
-        probe_detail_ =
-            "Windows: fork sandbox unavailable; set windows_allow_without_probe=true in config.json to "
-            "enable with header-derived (unverified) vtable indices.";
-        return false;
-    }
-    const std::string expected = config_.windows_expected_minecraft_version;
-    if (!expected.empty()) {
-        std::string actual = getServer().getMinecraftVersion();
-        if (actual.rfind(expected, 0) != 0) {
-            probe_detail_ = "Minecraft version mismatch: expected prefix '" + expected + "', got '" + actual + "'.";
-            return false;
-        }
-    }
-    probe_detail_ = "Windows: enabled without runtime probe (config override).";
-    return true;
-#else
-    return false;
-#endif
-}
-
-void StructBridgePlugin::startProbeWhenReady()
-{
-    if (probe_scheduled_) {
-        return;
-    }
-    probe_scheduled_ = true;
-    auto *self = this;
-    probe_task_ = getServer().getScheduler().runTaskTimer(
-        *this,
-        [self]() {
-            if (self->gate_ != GateState::NotProbed) {
-                if (self->probe_task_) {
-                    self->probe_task_->cancel();
-                }
-                return;
-            }
-            if (self->getServer().getLevel() == nullptr) {
-                if (++self->probe_attempts_ > 120) {
-                    self->getLogger().warning("Level not available after 120 attempts; native gate stays closed.");
-                    self->probe_task_->cancel();
-                }
-                return;
-            }
-            self->probe_task_->cancel();
-            self->runProbe(false);
-        },
-        20, 20);
-}
-
-void StructBridgePlugin::runProbe(bool manual)
-{
-#if !defined(_WIN32)
-    (void)manual;
-    fs::path out_file = getDataFolder() / "probe.mcstructure";
-    std::error_code ec;
-    fs::create_directories(getDataFolder(), ec);
-
-    auto &server = getServer();
-    if (server.getLevel() == nullptr) {
-        probe_stage_ = STAGE_NO_LEVEL;
-        probe_detail_ = "level not loaded yet";
-        gate_ = GateState::Unavailable;
-        return;
-    }
-
-    if (!config_.probe_enabled) {
-        probe_stage_ = STAGE_OK;
-        gate_ = GateState::Unavailable;
-        probe_detail_ = "probe disabled in config (probe_enabled=false)";
-        return;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        probe_detail_ = "fork() failed";
-        gate_ = GateState::Unavailable;
-        return;
-    }
-    if (pid == 0) {
-        // Child: crash-isolated sandbox (copy-on-write snapshot of the server).
-        probeChildMain(server, config_, out_file);
-        _exit(STAGE_MANAGER);  // unreachable
-    }
-    int status = 0;
-    waitpid(pid, &status, 0);
-    if (WIFEXITED(status)) {
-        int code = WEXITSTATUS(status);
-        probe_stage_ = code;
-        if (code == STAGE_OK) {
-            gate_ = GateState::Available;
-            probe_detail_ =
-                "full roundtrip verified (manager -> template save -> NBT write -> engine NBT parse -> "
-                "template load -> byte-identical re-serialization)";
-            getLogger().info("Native probe passed: structure export/import is ENABLED.");
-            auto sz = fs::file_size(out_file, ec);
-            if (!ec && config_.diagnostic_logging) {
-                getLogger().info("Probe artifact: {} bytes written to {}", sz, out_file.string());
-            }
-        }
-        else {
-            gate_ = GateState::Unavailable;
-            probe_detail_ = std::string("probe failed at stage '") + stageName(code) + "'";
-            getLogger().warning(
-                "Native probe FAILED at stage '{}' (code {}). Structure export/import stays DISABLED - "
-                "this server build is not adapted yet. All /struct* commands will refuse safely.",
-                stageName(code), code);
-            // Hex-dump the head of the roundtrip output (written by the child on
-            // import-roundtrip mismatches) so the actual bytes can be inspected.
-            const fs::path dbg = out_file.string() + ".roundtrip.bin";
-            std::error_code ec2;
-            auto dbg_size = fs::file_size(dbg, ec2);
-            if (!ec2 && dbg_size > 0) {
-                std::ifstream in(dbg, std::ios::binary);
-                std::size_t want = static_cast<std::size_t>(dbg_size);
-                if (want > 96) {
-                    want = 96;
-                }
-                std::vector<char> head(want);
-                in.read(head.data(), static_cast<std::streamsize>(want));
-                const auto got = static_cast<std::size_t>(in.gcount());
-                std::string hex;
-                hex.reserve(got * 3);
-                char buf[4];
-                for (std::size_t i = 0; i < got; ++i) {
-                    std::snprintf(buf, sizeof(buf), "%02X ",
-                                  static_cast<unsigned char>(head[i]));
-                    hex += buf;
-                }
-                getLogger().warning("Roundtrip head ({} of {} bytes): {}", got, dbg_size, hex);
-            }
-        }
-        return;
-    }
-    if (WIFSIGNALED(status)) {
-        probe_stage_ = 128 + WTERMSIG(status);
-        gate_ = GateState::Unavailable;
-        probe_detail_ = std::string("probe child killed by signal ") + std::to_string(WTERMSIG(status));
-        getLogger().warning("Native probe child crashed (signal {}): server is unaffected; feature DISABLED.",
-                            WTERMSIG(status));
-    }
-#else
-    probe_stage_ = 0;
-    if (evaluateWindowsGate()) {
-        gate_ = GateState::Available;
-        getLogger().info("Windows native gate opened via config override: {}", probe_detail_);
-    }
-    else {
-        gate_ = GateState::Unavailable;
-        getLogger().warning("Windows native gate stays closed: {}", probe_detail_);
-    }
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1779,7 +1475,6 @@ void StructBridgePlugin::syncExportsToPack()
 void StructBridgePlugin::onLoad()
 {
     loadConfig();
-    migrateLegacyLayout();
     // The API singleton must exist before ANY consumer asks for it (Python
     // plugins import the module during their own onLoad/onEnable, which may
     // run right after this one; C++ consumers dlsym at any time).
@@ -1787,8 +1482,8 @@ void StructBridgePlugin::onLoad()
 #ifdef STRUCTBRIDGE_PYTHON_API
     registerPythonModule();
 #endif
-    getLogger().info("StructBridge {} loaded (built against Endstone {}). Public API v{} is open.",
-                     kPluginVersion, ENDSTONE_VERSION, STRUCTBRIDGE_API_VERSION);
+    getLogger().info("StructBridge {} loaded (API v{}, Endstone {}).", kPluginVersion, STRUCTBRIDGE_API_VERSION,
+                     ENDSTONE_VERSION);
 }
 
 void StructBridgePlugin::onEnable()
@@ -1799,40 +1494,50 @@ void StructBridgePlugin::onEnable()
     std::error_code ec;
     fs::create_directories(libraryDir() / "mystructure", ec);
     syncExportsToPack();
-#if !defined(_WIN32)
-    startProbeWhenReady();
-#else
-    runProbe(false);
-#endif
+    // Kick off jobs that arrived through the API while this plugin was not
+    // enabled yet (the scheduler ignores tasks from disabled plugins).
+    auto pending_exports = std::move(pending_export_jobs_);
+    pending_export_jobs_.clear();
+    for (auto &job : pending_exports) {
+        startExportJob(job);
+    }
+    auto pending_places = std::move(pending_place_jobs_);
+    pending_place_jobs_.clear();
+    for (auto &job : pending_places) {
+        startPlaceJob(job);
+    }
 }
 
 void StructBridgePlugin::onDisable()
 {
-    if (probe_task_) {
-        probe_task_->cancel();
-        probe_task_ = nullptr;
-    }
-    // Cancel pending exports and clean up their tickingareas.
-    for (auto &job : export_jobs_) {
-        if (job->task) {
-            job->task->cancel();
-            job->task = nullptr;
-        }
-        for (const auto &area : job->area_names) {
-            getServer().dispatchCommand(getServer().getCommandSender(), "tickingarea remove " + area);
-        }
-        // Release any pending Python callback reference (the callback never
-        // fires for a cancelled job).
+    // Cancel pending jobs: restore teleported players, release their
+    // tickingareas and drop pending Python callback references (the callbacks
+    // never fire for a cancelled job).
+    auto drain = [this](auto &jobs) {
+        for (auto &job : jobs) {
+            if (job->task) {
+                job->task->cancel();
+                job->task = nullptr;
+            }
+            for (const auto &area : job->area_names) {
+                getServer().dispatchCommand(getServer().getCommandSender(), "tickingarea remove " + area);
+            }
+            restoreTeleportedPlayer(job->tp_player_name, job->tp_return);
 #ifdef STRUCTBRIDGE_PYTHON_API
-        if (job->py_on_done != nullptr) {
-            PyGILState_STATE gil = PyGILState_Ensure();
-            Py_DECREF(reinterpret_cast<PyObject *>(job->py_on_done));
-            PyGILState_Release(gil);
-            job->py_on_done = nullptr;
-        }
+            if (job->py_on_done != nullptr) {
+                PyGILState_STATE gil = PyGILState_Ensure();
+                Py_DECREF(reinterpret_cast<PyObject *>(job->py_on_done));
+                PyGILState_Release(gil);
+                job->py_on_done = nullptr;
+            }
 #endif
-    }
-    export_jobs_.clear();
+        }
+        jobs.clear();
+    };
+    drain(export_jobs_);
+    drain(place_jobs_);
+    drain(pending_export_jobs_);
+    drain(pending_place_jobs_);
 }
 
 bool StructBridgePlugin::checkPermission(endstone::CommandSender &sender)
@@ -1865,27 +1570,18 @@ endstone::Player *StructBridgePlugin::findPlayer(const std::string &name) const
 // ---------------------------------------------------------------------------
 // Command dispatch: ONE unified /struct command whose first argument selects
 // the subcommand (an engine-side enum, so tab completion works and invalid
-// subcommands are rejected by the command parser itself). The old /structxxx
-// commands stay registered as transition aliases for one release and map to
-// the same handlers with the action word stripped.
+// subcommands are rejected by the command parser itself).
 // ---------------------------------------------------------------------------
 namespace {
 void sendStructUsage(endstone::CommandSender &sender)
 {
-    sender.sendMessage("§eStructBridge 用法:");
-    sender.sendMessage("§e /struct export <名称> <x1> <y1> <z1> <x2> <y2> <z2> [entities] [blocks]");
-    sender.sendMessage("§7   导出区域 (超过 64x64 自动分片为结构束 .bundle)");
-    sender.sendMessage("§e /struct import <文件或名称>");
-    sender.sendMessage("§7   导入 .mcstructure 或 .bundle 结构束");
-    sender.sendMessage("§e /struct place <名称> <x> <y> <z> [entities] [blocks]");
-    sender.sendMessage("§e /struct place <名称> original [entities] [blocks]");
-    sender.sendMessage("§7   放置结构; original = 结构束按导出时的原坐标与维度复原");
-    sender.sendMessage("§e /struct dump <名称>  (导出已保存的结构)");
-    sender.sendMessage("§e /struct list [all|library|world|pack]");
-    sender.sendMessage("§7   列出结构 (默认只显示插件管理的; all=全部来源)");
-    sender.sendMessage("§e /struct delete <名称>");
-    sender.sendMessage("§e /struct clear  (删除全部插件管理的结构, 需二次确认)");
-    sender.sendMessage("§e /struct status | /struct probe | /struct api");
+    sender.sendMessage("§e/struct export <名称> <x1> <y1> <z1> <x2> <y2> <z2> [entities] [blocks]");
+    sender.sendMessage("§e/struct import <文件或名称>");
+    sender.sendMessage("§e/struct place <名称> <x> <y> <z> [entities] [blocks]  |  /struct place <名称> original");
+    sender.sendMessage("§e/struct dump <名称>");
+    sender.sendMessage("§e/struct list [all|library|world|pack]");
+    sender.sendMessage("§e/struct delete <名称>  |  /struct clear confirm");
+    sender.sendMessage("§e/struct status  |  /struct api");
 }
 
 // The unified /struct command receives [action: enum][args: message] - the
@@ -1921,34 +1617,17 @@ std::vector<std::string> splitSubArgs(const std::string &msg)
 bool StructBridgePlugin::onCommand(endstone::CommandSender &sender, const endstone::Command &command,
                                    const std::vector<std::string> &args)
 {
-    const auto &name = command.getName();
-    std::string action;
-    std::vector<std::string> rest;
-    if (name == "struct") {
-        if (args.empty()) {
-            sendStructUsage(sender);
-            return true;
-        }
-        action = args[0];
-        if (args.size() > 1) {
-            rest = splitSubArgs(args[1]);
-        }
+    if (command.getName() != "struct") {
+        return false;
     }
-    else {
-        // Legacy /structxxx aliases -> subcommand (their args carry no action
-        // word). Deprecated; will be removed in the next release.
-        static const std::map<std::string, std::string> legacy = {
-            {"structexport", "export"}, {"structimport", "import"},   {"structdump", "dump"},
-            {"structdelete", "delete"}, {"structlist", "list"},       {"structprobe", "probe"},
-            {"structstatus", "status"}, {"structapi", "api"},
-        };
-        const auto it = legacy.find(name);
-        if (it == legacy.end()) {
-            return false;
-        }
-        action = it->second;
-        rest = args;
-        sender.sendMessage("§7/{} 已弃用，将在下个版本移除。请改用 §e/struct {}§7。", name, action);
+    if (args.empty()) {
+        sendStructUsage(sender);
+        return true;
+    }
+    const std::string &action = args[0];
+    std::vector<std::string> rest;
+    if (args.size() > 1) {
+        rest = splitSubArgs(args[1]);
     }
 
     if (action == "export") {
@@ -1973,10 +1652,7 @@ bool StructBridgePlugin::onCommand(endstone::CommandSender &sender, const endsto
         handleClear(sender, rest);
     }
     else if (action == "status") {
-        handleStatus(sender, false);
-    }
-    else if (action == "probe") {
-        handleProbe(sender);
+        handleStatus(sender);
     }
     else if (action == "api") {
         handleApiSelfTest(sender);
@@ -2025,9 +1701,6 @@ void StructBridgePlugin::addOneArea(ExportJob &job, int cx1, int cz1, int cx2, i
     if (getServer().dispatchCommand(*origin, cmd)) {
         job.area_names.push_back(area_name);
     }
-    else if (config_.diagnostic_logging) {
-        getLogger().warning("Could not add ticking area '{}' (all 10 area slots may be in use).", area_name);
-    }
 }
 
 void StructBridgePlugin::addTickingAreasForJob(ExportJob &job)
@@ -2061,10 +1734,6 @@ void StructBridgePlugin::addTickingAreasForJob(ExportJob &job)
         // player's simulation distance. Mark for TP assist; exportTick
         // decides whether that is possible at all.
         job.tp_assist = true;
-        if (config_.diagnostic_logging) {
-            getLogger().warning("Tickingarea budget: {}/{} tiles covered for '{}' - TP assist required.",
-                                added, needed, job.name);
-        }
     }
 }
 
@@ -2079,7 +1748,22 @@ bool StructBridgePlugin::teleportJobPlayer(ExportJob &job, int x, int y, int z)
     if (player == nullptr) {
         return false;
     }
-    auto &level = *getServer().getLevel();
+    auto *level = getServer().getLevel();
+    if (level == nullptr) {
+        return false;
+    }
+    // Remember where the player was BEFORE the first move; finishExport()
+    // sends them back once the job is done.
+    if (!job.tp_return.valid) {
+        const auto &loc = player->getLocation();
+        job.tp_return.valid = true;
+        job.tp_return.dimension = loc.getDimension().getName();
+        job.tp_return.x = loc.getX();
+        job.tp_return.y = loc.getY();
+        job.tp_return.z = loc.getZ();
+        job.tp_return.pitch = loc.getPitch();
+        job.tp_return.yaw = loc.getYaw();
+    }
     if (job.via_player) {
         // keep the job's dimension (the save origin's dimension)
         if (auto *origin = findPlayer(job.player_name)) {
@@ -2089,9 +1773,30 @@ bool StructBridgePlugin::teleportJobPlayer(ExportJob &job, int x, int y, int z)
             return player->teleport(loc);
         }
     }
-    endstone::Location loc(*level.getDimension("overworld"), static_cast<float>(x) + 0.5F,
+    endstone::Location loc(*level->getDimension("overworld"), static_cast<float>(x) + 0.5F,
                            static_cast<float>(y), static_cast<float>(z) + 0.5F);
     return player->teleport(loc);
+}
+
+void StructBridgePlugin::restoreTeleportedPlayer(const std::string &player_name, const TpReturn &ret)
+{
+    if (!ret.valid || player_name.empty()) {
+        return;
+    }
+    auto *player = findPlayer(player_name);
+    auto *level = getServer().getLevel();
+    if (player == nullptr || level == nullptr) {
+        return;  // player left (or level down) - nothing to restore
+    }
+    auto *dim = level->getDimension(ret.dimension);
+    if (dim == nullptr) {
+        dim = level->getDimension("overworld");
+    }
+    if (dim == nullptr) {
+        return;
+    }
+    endstone::Location loc(*dim, ret.x, ret.y, ret.z, ret.pitch, ret.yaw);
+    player->teleport(loc);
 }
 
 void StructBridgePlugin::finishExport(std::shared_ptr<ExportJob> &job, const std::string &message, int stage)
@@ -2103,6 +1808,7 @@ void StructBridgePlugin::finishExport(std::shared_ptr<ExportJob> &job, const std
     for (const auto &area : job->area_names) {
         getServer().dispatchCommand(getServer().getCommandSender(), "tickingarea remove " + area);
     }
+    restoreTeleportedPlayer(job->tp_player_name, job->tp_return);
     if (job->via_player) {
         if (auto *player = findPlayer(job->player_name)) {
             player->sendMessage("{}", message);
@@ -2162,7 +1868,7 @@ void StructBridgePlugin::exportTick(std::shared_ptr<ExportJob> job)
     if (job->via_player) {
         auto *player = findPlayer(job->player_name);
         if (player == nullptr) {
-            finishExport(job, "§c导出中止: 玩家 " + job->player_name + " 已离线。", STAGE_API_ARG);
+            finishExport(job, "§c导出中止: 玩家已离线。", STAGE_API_NO_PLAYER);
             return;
         }
         origin = player;
@@ -2176,8 +1882,7 @@ void StructBridgePlugin::exportTick(std::shared_ptr<ExportJob> job)
         const int cx = (job->x1 + job->x2) / 2;
         const int cz = (job->z1 + job->z2) / 2;
         if (!teleportJobPlayer(*job, cx, job->y1, cz) && job->attempts >= config_.export_max_attempts) {
-            finishExport(job, "§c导出失败: 常加载区块预算不足，且无可传送的发起玩家 (仅允许传送发起者，绝不随机选择)。",
-                         STAGE_PLACE_AREA);
+            finishExport(job, "§c导出失败: 区块无法加载。", STAGE_PLACE_AREA);
             return;
         }
     }
@@ -2203,7 +1908,7 @@ void StructBridgePlugin::exportTick(std::shared_ptr<ExportJob> job)
                 std::vector<std::uint8_t> bytes;
                 int bstage = STAGE_OK;
                 if (buildMcstructureBytes(tpl, bytes, bstage)) {
-                    // Custom output dir (API exportRegionTo): write ONLY there.
+                    // Custom output dir (API): write ONLY there.
                     // Default: the plugin library + behavior-pack mirror.
                     const fs::path out_file = job->out_dir.empty()
                                                   ? libraryDir() / sanitizeRelativePath(job->name)
@@ -2222,36 +1927,24 @@ void StructBridgePlugin::exportTick(std::shared_ptr<ExportJob> job)
                                 // memory pre-registration.
                                 writeStructureFile(packStructuresDir() / sanitizeRelativePath(job->name), bytes);
                             }
-                            getLogger().info("Exported '{}' ({} bytes) to {}", job->name, bytes.size(),
+                            getLogger().info("Export '{}': {} bytes -> {}", job->name, bytes.size(),
                                              pathToUtf8(out_file));
-                            finishExport(job, "§a导出成功: " + pathToUtf8(out_file) + " (" +
-                                                  std::to_string(bytes.size()) + " 字节, 区域 " +
-                                                  std::to_string(job->x1) + " " + std::to_string(job->y1) + " " +
-                                                  std::to_string(job->z1) + " -> " + std::to_string(job->x2) + " " +
-                                                  std::to_string(job->y2) + " " + std::to_string(job->z2) + ")");
+                            finishExport(job, "§a导出完成: " + pathToUtf8(out_file) + " (" +
+                                                  std::to_string(bytes.size()) + " 字节)");
                             return;
                         }
                     }
-                    finishExport(job, "§c无法写入文件: " + pathToUtf8(out_file), STAGE_FILE);
+                    finishExport(job, "§c导出失败: 无法写入 " + pathToUtf8(out_file), STAGE_FILE);
                     return;
                 }
-                finishExport(job, std::string("§c序列化失败 (阶段: ") + stageName(bstage) + ")，导出中止。", bstage);
+                finishExport(job, "§c导出失败: 序列化错误。", bstage);
                 return;
             }
         }
     }
 
     if (job->attempts >= config_.export_max_attempts) {
-        std::string extra;
-        if (job->tp_assist) {
-            extra = " 本次区域超出了常加载区块预算 (10 个区域 × 100 区块)，"
-                    "且传送辅助未能补足。建议拆分区域，或由在线玩家在目标维度内发起导出。";
-        }
-        else {
-            extra = " 常见原因: 目标区域区块未能加载 (控制台导出且无人在线)、或服务器日志中有命令报错。";
-        }
-        finishExport(job, "§c导出失败: 原版 structure save 命令在 " + std::to_string(job->attempts) +
-                              " 次尝试内未生效。" + extra, STAGE_API_TIMEOUT);
+        finishExport(job, "§c导出失败: 区块加载超时。", STAGE_API_TIMEOUT);
     }
 }
 
@@ -2390,6 +2083,12 @@ fs::path StructBridgePlugin::bundleDirInLibrary(const std::string &name) const
 
 void StructBridgePlugin::startExportJob(std::shared_ptr<ExportJob> job)
 {
+    if (!isEnabled()) {
+        // The Endstone scheduler drops tasks from disabled plugins; start
+        // the timer (and the tickingareas) once onEnable() has run.
+        pending_export_jobs_.push_back(job);
+        return;
+    }
     addTickingAreasForJob(*job);
     export_jobs_.push_back(job);
     auto *self = this;
@@ -2413,7 +2112,7 @@ void StructBridgePlugin::bundleTick(std::shared_ptr<ExportJob> job)
 {
     auto &m = *job->bundle;
     // Bundle destination: the canonical library dir unless the API caller
-    // redirected it (exportRegionTo out_dir).
+    // redirected it (out_dir).
     const fs::path bundle_dir =
         job->bundle_dir_override.empty() ? bundleDirInLibrary(m.name) : job->bundle_dir_override;
     if (job->tile_index >= m.tiles.size()) {
@@ -2440,10 +2139,9 @@ void StructBridgePlugin::bundleTick(std::shared_ptr<ExportJob> job)
             }
         }
         const std::string dim_note = m.dimension == "overworld" ? "" : "，维度 " + m.dimension;
-        finishExport(job, "§a结构束导出成功: " + m.dirName() + " (" + std::to_string(m.tiles.size()) + " 片，区域 " +
-                              std::to_string(m.x1) + " " + std::to_string(m.y1) + " " + std::to_string(m.z1) +
-                              " -> " + std::to_string(m.x2) + " " + std::to_string(m.y2) + " " +
-                              std::to_string(m.z2) + dim_note + ")");
+        getLogger().info("Export bundle '{}': {} tiles -> {}", m.name, m.tiles.size(), pathToUtf8(bundle_dir));
+        finishExport(job, "§a结构束导出完成: " + m.dirName() + " (" + std::to_string(m.tiles.size()) + " 片" +
+                              dim_note + ")");
         return;
     }
 
@@ -2457,9 +2155,9 @@ void StructBridgePlugin::bundleTick(std::shared_ptr<ExportJob> job)
         if (player == nullptr) {
             m.partial = true;
             writeBundleManifest(m, bundle_dir);
-            finishExport(job, "§c结构束导出中止 (玩家离线)，已完成 " + std::to_string(job->tile_index) + "/" +
-                                  std::to_string(m.tiles.size()) + " 片，已标记为 partial。",
-                         STAGE_API_ARG);
+            finishExport(job, "§c结构束导出中止: 玩家已离线 (已完成 " + std::to_string(job->tile_index) + "/" +
+                                  std::to_string(m.tiles.size()) + " 片，partial)。",
+                         STAGE_API_NO_PLAYER);
             return;
         }
         origin = player;
@@ -2509,8 +2207,6 @@ void StructBridgePlugin::bundleTick(std::shared_ptr<ExportJob> job)
                         if (f.good()) {
                             tile.done = true;
                             writeBundleManifest(m, bundle_dir);  // incremental
-                            getLogger().info("Bundle '{}': tile {}/{} ({} bytes)", m.name, job->tile_index + 1,
-                                             m.tiles.size(), bytes.size());
                             // release this tile's areas and move on
                             for (const auto &area : job->area_names) {
                                 getServer().dispatchCommand(getServer().getCommandSender(),
@@ -2535,9 +2231,9 @@ void StructBridgePlugin::bundleTick(std::shared_ptr<ExportJob> job)
             getServer().dispatchCommand(getServer().getCommandSender(), "tickingarea remove " + area);
         }
         job->area_names.clear();
-        finishExport(job, "§c结构束第 " + std::to_string(job->tile_index + 1) + " 片导出失败 (区块加载超时)。已保留 " +
+        finishExport(job, "§c结构束导出失败: 第 " + std::to_string(job->tile_index + 1) + " 片超时 (已保留 " +
                               std::to_string(job->tile_index) + "/" + std::to_string(m.tiles.size()) +
-                              " 片并标记 partial；重跑同一区域可续传。",
+                              " 片，partial)。",
                      STAGE_BUNDLE_TILE);
     }
 }
@@ -2576,6 +2272,18 @@ bool StructBridgePlugin::teleportPlacePlayer(PlaceJob &job, int x, int y, int z)
     if (level == nullptr) {
         return false;
     }
+    // Remember where the player was BEFORE the first move; finishPlace()
+    // sends them back once the job is done.
+    if (!job.tp_return.valid) {
+        const auto &loc = player->getLocation();
+        job.tp_return.valid = true;
+        job.tp_return.dimension = loc.getDimension().getName();
+        job.tp_return.x = loc.getX();
+        job.tp_return.y = loc.getY();
+        job.tp_return.z = loc.getZ();
+        job.tp_return.pitch = loc.getPitch();
+        job.tp_return.yaw = loc.getYaw();
+    }
     auto *dim = level->getDimension(normalizeDimension(job.dimension));
     if (dim == nullptr) {
         dim = level->getDimension("overworld");
@@ -2590,6 +2298,10 @@ bool StructBridgePlugin::teleportPlacePlayer(PlaceJob &job, int x, int y, int z)
 
 void StructBridgePlugin::startPlaceJob(std::shared_ptr<PlaceJob> job)
 {
+    if (!isEnabled()) {
+        pending_place_jobs_.push_back(job);
+        return;
+    }
     place_jobs_.push_back(job);
     auto *self = this;
     std::weak_ptr<PlaceJob> weak = job;
@@ -2652,7 +2364,7 @@ void StructBridgePlugin::placeTick(std::shared_ptr<PlaceJob> job)
     }
     if (job->tp_assist && (job->attempts % 2) == 1) {
         if (!teleportPlacePlayer(*job, tx + 8, ty, tz + 8) && job->attempts >= config_.export_max_attempts) {
-            finishPlace(job, "§c放置失败: 目标区块无法加载 (常加载区块预算不足且无可传送的发起玩家)。", STAGE_PLACE_AREA);
+            finishPlace(job, "§c放置失败: 目标区块无法加载。", STAGE_PLACE_AREA);
             return;
         }
     }
@@ -2663,9 +2375,7 @@ void StructBridgePlugin::placeTick(std::shared_ptr<PlaceJob> job)
     if (dim != "overworld") {
         auto *player = findPlayer(job->tp_player_name);
         if (player == nullptr) {
-            finishPlace(job, "§c放置失败: 维度 " + dim + " 的放置需要一位在该维度的玩家 (tp_player)，"
-                             "仅允许使用指定的发起玩家。",
-                        STAGE_API_NO_PLAYER);
+            finishPlace(job, "§c放置失败: 维度 " + dim + " 需要在线的 tp_player。", STAGE_API_NO_PLAYER);
             return;
         }
         origin = player;
@@ -2683,7 +2393,7 @@ void StructBridgePlugin::placeTick(std::shared_ptr<PlaceJob> job)
         int stage = STAGE_OK;
         auto *manager = getManager(getServer(), stage);
         if (manager == nullptr) {
-            finishPlace(job, "§c获取 StructureManager 失败。", stage);
+            finishPlace(job, "§c放置失败: 引擎不可用。", stage);
             return;
         }
         const std::string full_key =
@@ -2705,13 +2415,13 @@ void StructBridgePlugin::placeTick(std::shared_ptr<PlaceJob> job)
                 std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
                                                 std::istreambuf_iterator<char>());
                 if (!in || !nbt_check::validate(bytes, "format_version")) {
-                    finishPlace(job, "§c结构文件缺失或损坏 (引擎与结构库均不可用): " + pathToUtf8(src),
-                                job->bundle ? STAGE_BUNDLE_MANIFEST : STAGE_API_NOT_FOUND);
+                    finishPlace(job, "§c放置失败: 结构文件缺失或损坏。", job->bundle ? STAGE_BUNDLE_MANIFEST
+                                                                                        : STAGE_API_NOT_FOUND);
                     return;
                 }
                 const int rc = importMcstructureBytes(manager, full_key, bytes);
                 if (rc != STAGE_OK) {
-                    finishPlace(job, std::string("§c结构导入失败 (阶段: ") + stageName(rc) + ")。", rc);
+                    finishPlace(job, "§c放置失败: 结构导入错误。", rc);
                     return;
                 }
             }
@@ -2751,8 +2461,7 @@ void StructBridgePlugin::placeTick(std::shared_ptr<PlaceJob> job)
             getServer().dispatchCommand(getServer().getCommandSender(), "tickingarea remove " + area);
         }
         job->area_names.clear();
-        finishPlace(job, "§c放置失败: structure load 命令在 " + std::to_string(job->attempts) +
-                             " 次尝试内未生效 (目标区块可能未加载)。", STAGE_PLACE_LOAD);
+        finishPlace(job, "§c放置失败: 区块加载超时。", STAGE_PLACE_LOAD);
     }
 }
 
@@ -2765,11 +2474,15 @@ void StructBridgePlugin::finishPlace(std::shared_ptr<PlaceJob> &job, const std::
     for (const auto &area : job->area_names) {
         getServer().dispatchCommand(getServer().getCommandSender(), "tickingarea remove " + area);
     }
-    if (job->tp_player_name.empty()) {
-        getServer().getCommandSender().sendMessage("{}", message);
-    }
-    else if (auto *player = findPlayer(job->tp_player_name)) {
-        player->sendMessage("{}", message);
+    restoreTeleportedPlayer(job->tp_player_name, job->tp_return);
+    if (job->c_on_done == nullptr && job->py_on_done == nullptr) {
+        // Command-initiated job: report to the initiator (or the console).
+        if (auto *player = findPlayer(job->tp_player_name)) {
+            player->sendMessage("{}", message);
+        }
+        else {
+            getServer().getCommandSender().sendMessage("{}", message);
+        }
     }
     getLogger().info("Place '{}': {}", job->name, stripColorCodes(message));
 
@@ -2800,71 +2513,6 @@ void StructBridgePlugin::finishPlace(std::shared_ptr<PlaceJob> &job, const std::
                       place_jobs_.end());
 }
 
-// ---------------------------------------------------------------------------
-// Layout migration: pre-0.1.0 used exports/ (+ a default/ subfolder from an
-// even older release). 0.1.0 renames to library/ and folds default/ into
-// mystructure/ once, then keeps the config in sync.
-// ---------------------------------------------------------------------------
-void StructBridgePlugin::migrateLegacyLayout()
-{
-    const fs::path data = getDataFolder();
-    const fs::path legacy_dir = data / "exports";
-    const fs::path lib_dir = data / pathFromUtf8(config_.library_dir);
-    std::error_code ec;
-
-    // 1) exports/ -> library/ (only when the target does not exist yet).
-    if (fs::exists(legacy_dir, ec) && !fs::exists(lib_dir, ec)) {
-        fs::rename(legacy_dir, lib_dir, ec);
-        if (ec) {
-            // rename across devices or similar - copy instead
-            ec.clear();
-            fs::copy(legacy_dir, lib_dir, fs::copy_options::recursive, ec);
-            if (!ec) {
-                fs::remove_all(legacy_dir, ec);
-            }
-        }
-        if (!ec) {
-            getLogger().info("Migrated structure library: exports/ -> {}", config_.library_dir);
-        }
-    }
-
-    // 2) legacy default/ namespace folder -> mystructure/ inside the library.
-    const fs::path legacy_ns = lib_dir / "default";
-    const fs::path real_ns = lib_dir / "mystructure";
-    if (fs::exists(legacy_ns, ec) && !fs::exists(real_ns, ec)) {
-        fs::rename(legacy_ns, real_ns, ec);
-        if (!ec) {
-            getLogger().info("Migrated legacy library layout: default/ -> mystructure/");
-        }
-    }
-
-    // 3) Rewrite config.json when it still references the old layout.
-    if (!config_.output_dir_legacy.empty()) {
-        json j;
-        bool need_write = false;
-        try {
-            std::ifstream in(data / "config.json");
-            in >> j;
-            if (j.contains("output_dir")) {
-                j.erase("output_dir");
-                need_write = true;
-            }
-            if (!j.contains("library_dir")) {
-                j["library_dir"] = config_.library_dir;
-                need_write = true;
-            }
-        }
-        catch (const std::exception &) {
-            return;
-        }
-        if (need_write) {
-            std::ofstream out(data / "config.json");
-            out << j.dump(2) << std::endl;
-            getLogger().info("Migrated config.json: output_dir -> library_dir");
-        }
-    }
-}
-
 fs::path StructBridgePlugin::serverRoot() const
 {
     // getDataFolder() = <server>/plugins/structbridge
@@ -2877,10 +2525,6 @@ fs::path StructBridgePlugin::serverRoot() const
 
 void StructBridgePlugin::handleExport(endstone::CommandSender &sender, const std::vector<std::string> &args)
 {
-    if (gate_ != GateState::Available) {
-        sender.sendMessage("§cStructBridge 未适配当前服务端，结构导出暂不可用。输入 /struct status 查看详情。");
-        return;
-    }
     if (!checkPermission(sender)) {
         return;
     }
@@ -2890,8 +2534,7 @@ void StructBridgePlugin::handleExport(endstone::CommandSender &sender, const std
     }
     const std::string &name = args[0];
     if (!isValidStructureName(name)) {
-        sender.sendMessage(
-            "§c结构名称非法: 只允许 字母/数字/_/-/. 和一个可选的命名空间冒号，例如 myhouse 或 pack:house");
+        sender.sendMessage("§c结构名称非法。");
         return;
     }
     int coords[6];
@@ -2918,7 +2561,7 @@ void StructBridgePlugin::handleExport(endstone::CommandSender &sender, const std
     int x2 = std::max(coords[0], coords[3]), y2 = std::max(coords[1], coords[4]),
         z2 = std::max(coords[2], coords[5]);
     if (y2 - y1 > 384) {
-        sender.sendMessage("§c区域过大 (Y 轴最多 384 格 - 引擎结构高度上限; 世界本身也只有 384 格高)。");
+        sender.sendMessage("§c区域过大: Y 轴最多 384 格。");
         return;
     }
 
@@ -2948,8 +2591,8 @@ void StructBridgePlugin::handleExport(endstone::CommandSender &sender, const std
         job->bundle = planBundle(name, x1, y1, z1, x2, y2, z2, dimension, entities, blocks);
         job->bundle->src_dir = bundleDirInLibrary(name);
         writeBundleManifest(*job->bundle, bundleDirInLibrary(name));
-        sender.sendMessage("§7区域 {}x{} 超过单片上限 64x64 (引擎限制 64x384x64)，自动分片为结构束 §e{}§7 ({} 片，逐片导出)…",
-                           x2 - x1 + 1, z2 - z1 + 1, name + ".bundle", job->bundle->tiles.size());
+        sender.sendMessage("§7区域超过 64x64，分片为结构束 {} ({} 片)…", name + ".bundle",
+                           job->bundle->tiles.size());
     }
     startExportJob(job);
 
@@ -2965,15 +2608,11 @@ void StructBridgePlugin::handleExport(endstone::CommandSender &sender, const std
 // ---------------------------------------------------------------------------
 void StructBridgePlugin::handleImport(endstone::CommandSender &sender, const std::vector<std::string> &args)
 {
-    if (gate_ != GateState::Available) {
-        sender.sendMessage("§cStructBridge 未适配当前服务端，结构导入暂不可用。输入 /struct status 查看详情。");
-        return;
-    }
     if (!checkPermission(sender)) {
         return;
     }
     if (args.size() != 1) {
-        sender.sendMessage("§e用法: /struct import <文件或名称>  (名称=文件名: 自动查找结构库; 也可直接给文件路径)");
+        sender.sendMessage("§e用法: /struct import <文件或名称>");
         return;
     }
     // Message-typed parameter: accepts bare numeric names, quoted strings and
@@ -3022,8 +2661,7 @@ void StructBridgePlugin::handleImport(endstone::CommandSender &sender, const std
         file = maybe_bundle ? bundleDirInLibrary(name) : libraryDir() / sanitizeRelativePath(name);
     }
     if (!isValidStructureName(name)) {
-        sender.sendMessage("§c结构名称非法: 只允许 中文等UTF-8字符/字母/数字/_/-/. 和一个可选的命名空间冒号，"
-                           "例如 123、myhouse 或 中文屋。");
+        sender.sendMessage("§c结构名称非法。");
         return;
     }
     if (!fs::exists(file)) {
@@ -3043,7 +2681,7 @@ void StructBridgePlugin::handleImport(endstone::CommandSender &sender, const std
         file = file.parent_path();
     }
     if (!fs::exists(file)) {
-        sender.sendMessage("§c文件不存在: {} (未指定路径时自动查找结构库)", pathToUtf8(file));
+        sender.sendMessage("§c文件不存在: {}", pathToUtf8(file));
         return;
     }
 
@@ -3092,10 +2730,8 @@ void StructBridgePlugin::handleImport(endstone::CommandSender &sender, const std
                                    bytes);
             }
         }
-        const std::string partial_note = manifest->partial ? "§c[partial: 部分分片缺失]§a " : "";
-        sender.sendMessage("§a结构束导入成功: {}{} ({} 片已注册)。放置: §e/struct place {} <x> <y> <z>§a 或 §e/struct "
-                           "place {} original§a 原位复原。",
-                           partial_note, manifest->name, imported, manifest->name, manifest->name);
+        const std::string partial_note = manifest->partial ? "§c[partial]§a " : "";
+        sender.sendMessage("§a结构束导入成功: {}{} ({} 片)。", partial_note, manifest->name, imported);
         getLogger().info("Imported bundle '{}' ({} tiles) from {}", manifest->name, imported, pathToUtf8(file));
         return;
     }
@@ -3130,9 +2766,7 @@ void StructBridgePlugin::handleImport(endstone::CommandSender &sender, const std
     // above only covers THIS session.
     writeStructureFile(libraryDir() / sanitizeRelativePath(name), bytes);
     writeStructureFile(packStructuresDir() / sanitizeRelativePath(name), bytes);
-    sender.sendMessage(
-        "§a导入成功: {}。立即可用: §e/structure load {} [x y z]§a 或 §e/struct place {} <x> <y> <z>§a；重启后依然可用。",
-        name, name, name);
+    sender.sendMessage("§a导入成功: {}。", name);
     getLogger().info("Imported '{}' ({} bytes) from {} into manager key '{}'", name, bytes.size(), pathToUtf8(file),
                      key);
 }
@@ -3147,10 +2781,6 @@ void StructBridgePlugin::handleImport(endstone::CommandSender &sender, const std
 // ---------------------------------------------------------------------------
 void StructBridgePlugin::handlePlace(endstone::CommandSender &sender, const std::vector<std::string> &args)
 {
-    if (gate_ != GateState::Available) {
-        sender.sendMessage("§cStructBridge 未适配当前服务端，结构放置暂不可用。输入 /struct status 查看详情。");
-        return;
-    }
     if (!checkPermission(sender)) {
         return;
     }
@@ -3189,7 +2819,7 @@ void StructBridgePlugin::handlePlace(endstone::CommandSender &sender, const std:
             z = std::stoi(args[3]);
         }
         catch (const std::exception &) {
-            sender.sendMessage("§c坐标必须是整数 (或使用 original 进行结构束原位复原)。");
+            sender.sendMessage("§c坐标必须是整数。");
             return;
         }
     }
@@ -3230,16 +2860,10 @@ void StructBridgePlugin::handlePlace(endstone::CommandSender &sender, const std:
             job->z = bundle_ref->z1;
             dimension = bundle_ref->dimension;
         }
-        sender.sendMessage("§7结构束 §e{}§7: {} 片，{}",
-                           bundle_ref->dirName(), bundle_ref->tiles.size(),
-                           original ? "按原坐标复原 (" + std::to_string(bundle_ref->x1) + " " +
-                                           std::to_string(bundle_ref->y1) + " " +
-                                           std::to_string(bundle_ref->z1) + ", 维度 " +
-                                           bundle_ref->dimension + ")"
-                                    : "目标 " + std::to_string(x) + " " + std::to_string(y) + " " +
-                                           std::to_string(z));
+        sender.sendMessage("§7结构束 {}: {} 片{}", bundle_ref->dirName(), bundle_ref->tiles.size(),
+                           original ? "，按原坐标复原" : "");
         if (bundle_ref->partial) {
-            sender.sendMessage("§e注意: 该结构束标记为 partial (导出时有分片失败)，复原可能不完整。");
+            sender.sendMessage("§e注意: 该结构束为 partial，复原可能不完整。");
         }
     }
     else {
@@ -3247,7 +2871,7 @@ void StructBridgePlugin::handlePlace(endstone::CommandSender &sender, const std:
         // behavior pack or the world database - otherwise fail fast instead
         // of spinning the retry timer.
         if (original) {
-            sender.sendMessage("§coriginal 仅支持结构束 (.bundle)。单个结构文件不记录原坐标，请给出 <x> <y> <z>。");
+            sender.sendMessage("§coriginal 仅支持结构束 (.bundle)。");
             return;
         }
         const std::string full_key = name.find(':') == std::string::npos ? "mystructure:" + name : name;
@@ -3266,8 +2890,7 @@ void StructBridgePlugin::handlePlace(endstone::CommandSender &sender, const std:
             }
         }
         if (!found) {
-            sender.sendMessage("§c未找到结构 §e{}§c。用 §e/struct list§c 查看可用的结构 (引擎内存/结构库/行为包/世界数据库)。",
-                               name);
+            sender.sendMessage("§c未找到结构 '{}'。", name);
             return;
         }
     }
@@ -3287,15 +2910,11 @@ void StructBridgePlugin::handlePlace(endstone::CommandSender &sender, const std:
 // ---------------------------------------------------------------------------
 void StructBridgePlugin::handleDump(endstone::CommandSender &sender, const std::vector<std::string> &args)
 {
-    if (gate_ != GateState::Available) {
-        sender.sendMessage("§cStructBridge 未适配当前服务端，结构导出暂不可用。输入 /structstatus 查看详情。");
-        return;
-    }
     if (!checkPermission(sender)) {
         return;
     }
     if (args.empty()) {
-        sender.sendMessage("§e用法: /struct dump <名称>  (导出已保存的结构: 结构块界面保存的或 /structure save 保存的)");
+        sender.sendMessage("§e用法: /struct dump <名称>");
         return;
     }
     // The message-typed parameter preserves surrounding quotes - strip them,
@@ -3305,8 +2924,7 @@ void StructBridgePlugin::handleDump(endstone::CommandSender &sender, const std::
         name = name.substr(1, name.size() - 2);
     }
     if (!isValidStructureName(name)) {
-        sender.sendMessage("§c结构名称非法: 只允许 中文等UTF-8字符/字母/数字/_/-/. 和一个可选的命名空间冒号，"
-                           "例如 123、myhouse 或 中文屋。");
+        sender.sendMessage("§c结构名称非法。");
         return;
     }
 
@@ -3339,9 +2957,7 @@ void StructBridgePlugin::handleDump(endstone::CommandSender &sender, const std::
         }
     }
     if (tpl == nullptr) {
-        sender.sendMessage("§c未找到结构 '{}'。请先保存: 在结构块界面点击\"保存\"，或使用 "
-                           "§e/structure save {} <x1> <y1> <z1> <x2> <y2> <z2>§c (末尾加 §edisk§c 可跨重启保存)。",
-                           name, name);
+        sender.sendMessage("§c未找到结构 '{}'。", name);
         return;
     }
 
@@ -3622,15 +3238,11 @@ std::shared_ptr<BundleManifest> StructBridgePlugin::resolveBundleRef(const std::
 // ---------------------------------------------------------------------------
 void StructBridgePlugin::handleDelete(endstone::CommandSender &sender, const std::vector<std::string> &args)
 {
-    if (gate_ != GateState::Available) {
-        sender.sendMessage("§cStructBridge 未适配当前服务端，结构删除暂不可用。输入 /struct status 查看详情。");
-        return;
-    }
     if (!checkPermission(sender)) {
         return;
     }
     if (args.empty()) {
-        sender.sendMessage("§e用法: /struct delete <名称>  (批量删除请用 /struct clear，需二次确认)");
+        sender.sendMessage("§e用法: /struct delete <名称>");
         return;
     }
     std::string name = args[0];
@@ -3638,18 +3250,17 @@ void StructBridgePlugin::handleDelete(endstone::CommandSender &sender, const std
         name = name.substr(1, name.size() - 2);
     }
     if (name == "全部" || name == "all" || name == "*") {
-        sender.sendMessage("§e单个删除不接受 '{}'。批量删除请用 §e/struct clear§e (需二次确认)。", name);
+        sender.sendMessage("§e批量删除请用 /struct clear。");
         return;
     }
     if (!isValidStructureName(name)) {
-        sender.sendMessage("§c结构名称非法: 只允许 中文等UTF-8字符/字母/数字/_/-/. 和一个可选的命名空间冒号，"
-                           "例如 123、myhouse 或 中文屋。");
+        sender.sendMessage("§c结构名称非法。");
         return;
     }
     std::string local = name;
     if (auto pos = name.find(':'); pos != std::string::npos) {
         if (name.substr(0, pos) != "mystructure") {
-            sender.sendMessage("§c只能删除 mystructure: 命名空间的结构 (裸名自动归入)。其他命名空间属于行为包，受保护。");
+            sender.sendMessage("§c只能删除 mystructure: 命名空间的结构。");
             return;
         }
         local = name.substr(pos + 1);
@@ -3716,19 +3327,14 @@ void StructBridgePlugin::handleDelete(endstone::CommandSender &sender, const std
     }
 
     if (!engine_gone) {
-        sender.sendMessage("§c引擎仍报告结构 {} 存在于内存中，请查看服务器日志确认删除结果。", key);
+        sender.sendMessage("§c删除失败: {} 仍存在于内存中。", key);
         return;
     }
     if (removed.empty() && !had_in_memory && !still_in_db) {
-        sender.sendMessage("§e结构 '{}' 未找到 (内存/插件文件/世界数据库均无)。", local);
+        sender.sendMessage("§e结构 '{}' 未找到。", local);
         return;
     }
-    sender.sendMessage("§a删除完成: '{}'。内存: 已清除; 世界数据库: {}{}。", local,
-                       still_in_db ? "§c条目仍在 (引擎写入有延迟，重启后复查)" : "§a已清除",
-                       removed.empty() ? "" : "；删除 " + std::to_string(removed.size()) + " 个文件");
-    for (const auto &f : removed) {
-        sender.sendMessage("§7  - 已删除文件: {}", f);
-    }
+    sender.sendMessage("§a删除完成: '{}'。", local);
     getLogger().info("Delete '{}': engine gone, db {}, {} plugin file(s) removed", local, still_in_db ? "left" : "gone",
                      removed.size());
 }
@@ -3757,7 +3363,7 @@ void StructBridgePlugin::handleList(endstone::CommandSender &sender, const std::
     auto bundles = collectBundles();
     auto items = collectStructures();
     StructureManager *manager = nullptr;
-    if (gate_ == GateState::Available) {
+    {
         int stage = STAGE_OK;
         manager = getManager(getServer(), stage);
     }
@@ -3841,13 +3447,11 @@ void StructBridgePlugin::handleList(endstone::CommandSender &sender, const std::
 
     const bool show_bundles = filter != "world" && filter != "pack";
     if (shown == 0 && !(show_bundles && !bundles.empty())) {
-        sender.sendMessage("§e未找到结构 (过滤: {}; /struct list all 查看全部来源)。", filter);
+        sender.sendMessage("§e未找到结构。");
         return;
     }
     sender.sendMessage("§6{} 个结构 §7(§a插件库 {}§7 | §b行为包 {}§7 | §d世界存档 {}§7){}:", shown, n_lib, n_pack, n_world,
                        show_bundles && !bundles.empty() ? " + " + std::to_string(bundles.size()) + " 个结构束" : "");
-    sender.sendMessage("§7来源: §a库§7=插件结构库 | §b包§7=行为包自带 (受保护) | §d世界§7=结构块或 structure save 存档。"
-                       "删除: /struct delete <名称> 或 /struct clear。");
     getLogger().info("Listed {} structure(s) + {} bundle(s) (filter={}, library {}, pack {}, world {})", shown,
                      bundles.size(), filter, n_lib, n_pack, n_world);
 }
@@ -3862,10 +3466,6 @@ void StructBridgePlugin::handleList(endstone::CommandSender &sender, const std::
 // ---------------------------------------------------------------------------
 void StructBridgePlugin::handleClear(endstone::CommandSender &sender, const std::vector<std::string> &args)
 {
-    if (gate_ != GateState::Available) {
-        sender.sendMessage("§cStructBridge 未适配当前服务端，该功能暂不可用。输入 /struct status 查看详情。");
-        return;
-    }
     if (!checkPermission(sender)) {
         return;
     }
@@ -3884,8 +3484,7 @@ void StructBridgePlugin::handleClear(endstone::CommandSender &sender, const std:
                     ++managed;
                 }
             }
-            sender.sendMessage("§e即将删除 §c{} 个结构 + {} 个结构束§e (引擎内存+数据库+全部文件)。", managed,
-                               bundles.size());
+            sender.sendMessage("§e即将删除 {} 个结构 + {} 个结构束。", managed, bundles.size());
             sender.sendMessage("§e此操作不可撤销。确认请输入 §c/struct clear confirm§e (60 秒内有效)。");
             return;
         }
@@ -3929,7 +3528,7 @@ void StructBridgePlugin::handleClear(endstone::CommandSender &sender, const std:
         // in_world (LevelDB entry) or loaded right now. Pure library files
         // would just produce "structure not found" noise in the log.
         bool engine_knows = item.in_world;
-        if (!engine_knows && gate_ == GateState::Available) {
+        if (!engine_knows) {
             int stage = STAGE_OK;
             if (auto *manager = getManager(getServer(), stage)) {
                 engine_knows = manager->getStructure(item.key) != nullptr;
@@ -3947,8 +3546,7 @@ void StructBridgePlugin::handleClear(endstone::CommandSender &sender, const std:
             ec.clear();
         }
     }
-    sender.sendMessage("§a清理完成: {} 个结构 + {} 个结构束，共删除 {} 个文件。行为包自带与世界独有的结构不受影响。",
-                       structures, bundles_deleted, files);
+    sender.sendMessage("§a清理完成: {} 个结构 + {} 个结构束 ({} 个文件)。", structures, bundles_deleted, files);
     getLogger().info("Clear-all: {} structures, {} bundles, {} files removed", structures, bundles_deleted, files);
 }
 
@@ -3961,10 +3559,6 @@ void StructBridgePlugin::handleClear(endstone::CommandSender &sender, const std:
 // ---------------------------------------------------------------------------
 int StructBridgePlugin::apiImport(const std::string &name_or_path, std::string &msg)
 {
-    if (gate_ != GateState::Available) {
-        msg = "StructBridge 未通过兼容性探针，功能不可用 (/struct status 查看详情)";
-        return STAGE_API_GATE;
-    }
     std::string arg = name_or_path;
     if (arg.size() >= 2 && arg.front() == '"' && arg.back() == '"') {
         arg = arg.substr(1, arg.size() - 2);
@@ -4086,10 +3680,6 @@ int StructBridgePlugin::apiImport(const std::string &name_or_path, std::string &
 
 int StructBridgePlugin::apiDump(const std::string &name, std::string &msg)
 {
-    if (gate_ != GateState::Available) {
-        msg = "StructBridge 未通过兼容性探针，功能不可用";
-        return STAGE_API_GATE;
-    }
     std::string clean = name;
     if (clean.size() >= 2 && clean.front() == '"' && clean.back() == '"') {
         clean = clean.substr(1, clean.size() - 2);
@@ -4153,10 +3743,6 @@ int StructBridgePlugin::apiDump(const std::string &name, std::string &msg)
 
 int StructBridgePlugin::apiDelete(const char *name_or_null, std::string &msg)
 {
-    if (gate_ != GateState::Available) {
-        msg = "StructBridge 未通过兼容性探针，功能不可用";
-        return STAGE_API_GATE;
-    }
     auto dispatch_engine_delete = [&](const std::string &key) {
         getServer().dispatchCommand(getServer().getCommandSender(), "structure delete \"" + key + "\"");
     };
@@ -4269,28 +3855,10 @@ int StructBridgePlugin::apiDelete(const char *name_or_null, std::string &msg)
 
 std::uint64_t StructBridgePlugin::apiExportRegion(const std::string &name, int x1, int y1, int z1, int x2, int y2,
                                                   int z2, const char *dimension, bool entities, bool blocks,
+                                                  const char *out_dir, const char *tp_player, bool force_bundle,
                                                   void (*on_done)(void *ctx, int stage, const char *message),
                                                   void *ctx, void *py_on_done)
 {
-    // v1 shim: same job machinery, library output, overworld-only (the console
-    // origin Endstone binds for API callers is the overworld; dimensioned
-    // exports go through apiExportRegionTo with an explicit tp_player).
-    if (dimension != nullptr && normalizeDimension(dimension) != "overworld") {
-        return 0;
-    }
-    return apiExportRegionTo(name, x1, y1, z1, x2, y2, z2, dimension, entities, blocks, nullptr, nullptr, false,
-                             on_done, ctx, py_on_done);
-}
-
-std::uint64_t StructBridgePlugin::apiExportRegionTo(const std::string &name, int x1, int y1, int z1, int x2, int y2,
-                                                    int z2, const char *dimension, bool entities, bool blocks,
-                                                    const char *out_dir, const char *tp_player, bool force_bundle,
-                                                    void (*on_done)(void *ctx, int stage, const char *message),
-                                                    void *ctx, void *py_on_done)
-{
-    if (gate_ != GateState::Available) {
-        return 0;
-    }
     if (!isValidStructureName(name)) {
         return 0;
     }
@@ -4368,9 +3936,6 @@ std::uint64_t StructBridgePlugin::apiPlaceStructure(const std::string &name, int
                                                     void (*on_done)(void *ctx, int stage, const char *message),
                                                     void *ctx, void *py_on_done)
 {
-    if (gate_ != GateState::Available) {
-        return 0;
-    }
     // Path-form bundle references (relative to the server root, or absolute)
     // are valid even though they are not plain structure names.
     auto bundle_ref = resolveBundleRef(name);
@@ -4476,79 +4041,27 @@ void StructBridgePlugin::handleApiSelfTest(endstone::CommandSender &sender)
     }
     auto *api = get_fn();
     if (api == nullptr) {
-        sender.sendMessage("§cAPI 自检失败: structbridge_get_api() 返回空 (插件未完成加载)。");
+        sender.sendMessage("§cAPI 自检失败: structbridge_get_api() 返回空。");
         return;
     }
-    sender.sendMessage("§aAPI 自检通过: 库已加载，符号可解析，接口可调用。");
-    sender.sendMessage("§7 - 库: {}", info.dli_fname);
-    sender.sendMessage("§7 - API 版本: {} (插件 v{}), 可用: {}", api->apiVersion(), api->version(),
-                       api->isAvailable() ? "是" : "否");
-    const int count = api->listStructures(nullptr, nullptr);
-    sender.sendMessage("§7 - listStructures() -> {} 个结构", count);
+    sender.sendMessage("§aAPI 自检通过 (API v{}, 插件 v{})。", api->apiVersion(), api->version());
     getLogger().info("[api] Self-test passed via {}", info.dli_fname);
 #else
-    sender.sendMessage("§eAPI 自检 (dlopen/dlsym) 仅支持 Linux。");
+    sender.sendMessage("§eAPI 自检仅支持 Linux。");
 #endif
 }
 
 // ---------------------------------------------------------------------------
-// /structprobe
+// /struct status - versions, layout, retry budgets and in-flight jobs.
 // ---------------------------------------------------------------------------
-void StructBridgePlugin::handleProbe(endstone::CommandSender &sender)
+void StructBridgePlugin::handleStatus(endstone::CommandSender &sender)
 {
-    if (!checkPermission(sender)) {
-        return;
-    }
-    if (getServer().getLevel() == nullptr) {
-        sender.sendMessage("§c世界尚未加载完成，无法探测。稍后重试。");
-        return;
-    }
-    gate_ = GateState::NotProbed;
-    probe_stage_ = -1;
-    probe_detail_.clear();
-    runProbe(true);
-    if (gate_ == GateState::Available) {
-        sender.sendMessage("§a探测通过，功能已启用: {}", probe_detail_);
-    }
-    else {
-        sender.sendMessage("§c探测未通过 (阶段: {}, {})。功能保持禁用。", stageName(probe_stage_), probe_detail_);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// /struct status - gate state, layout, retry budgets and in-flight jobs.
-// ---------------------------------------------------------------------------
-void StructBridgePlugin::handleStatus(endstone::CommandSender &sender, bool rerun_probe)
-{
-    if (rerun_probe && getServer().getLevel() != nullptr) {
-        gate_ = GateState::NotProbed;
-        probe_stage_ = -1;
-        probe_detail_.clear();
-        runProbe(true);
-    }
     sender.sendMessage("§7=== StructBridge 状态 ===");
-    const char *state = gate_ == GateState::Available      ? "§a可用"
-                        : gate_ == GateState::Unavailable ? "§c不可用"
-                                                           : "§e未探测";
-    sender.sendMessage("原生链路: {}{}", state,
-                       probe_stage_ >= 0 ? " §7(最后探测阶段: " + std::string(stageName(probe_stage_)) + ")"
-                                         : "");
-    if (!probe_detail_.empty()) {
-        sender.sendMessage("§7详情: {}", probe_detail_);
-    }
-    sender.sendMessage("§7Endstone: {} | Minecraft: {} | 插件: {} (API v{})", getServer().getVersion(),
-                       getServer().getMinecraftVersion(), kPluginVersion, STRUCTBRIDGE_API_VERSION);
+    sender.sendMessage("§7插件: {} (API v{}) | Endstone: {} | Minecraft: {}", kPluginVersion,
+                       STRUCTBRIDGE_API_VERSION, getServer().getVersion(), getServer().getMinecraftVersion());
     sender.sendMessage("§7结构库: {}", pathToUtf8(libraryDir()));
-    sender.sendMessage("§7导出: 原版 structure save (引擎捕获) + 重试 {} 次 / 每 {} tick | 导入: 引擎虚 load 链路",
-                       config_.export_max_attempts, config_.export_retry_interval_ticks);
     sender.sendMessage("§7进行中的任务: 导出 {} | 放置 {} | 结构束 {} 个", export_jobs_.size(), place_jobs_.size(),
                        collectBundles().size());
-#if defined(_WIN32)
-    sender.sendMessage("§7平台: Windows (无 fork 沙箱，需在 config.json 显式开启)");
-#else
-    sender.sendMessage("§7平台: Linux (fork 沙箱实测)");
-#endif
-    sender.sendMessage("§7提示: 超过 64x64 的导出会自动分片为结构束; TP 辅助只传送发起操作的玩家本人。");
 }
 
 // ---------------------------------------------------------------------------
@@ -4567,7 +4080,7 @@ public:
     }
     [[nodiscard]] bool isAvailable() const override
     {
-        return plugin_->gate_ == GateState::Available;
+        return true;
     }
     [[nodiscard]] const char *version() const override
     {
@@ -4577,31 +4090,22 @@ public:
     {
         return stageName(stage);
     }
+    // Export a region. out_dir redirects output (nullptr/"" = library);
+    // tp_player names the ONLY player the job may teleport (dimensioned
+    // exports and chunk-load assist); nullptr/"" disables teleport assist.
+    // force_bundle always splits into tiles even when the region fits in one.
     std::uint64_t exportRegion(const char *name, int x1, int y1, int z1, int x2, int y2, int z2,
                                const char *dimension, bool include_entities, bool include_blocks,
+                               const char *out_dir, const char *tp_player, bool force_bundle,
                                void (*on_done)(void *ctx, int stage, const char *message), void *ctx) override
     {
         if (name == nullptr) {
             return 0;
         }
-        return plugin_->apiExportRegion(name, x1, y1, z1, x2, y2, z2, dimension, include_entities,
-                                        include_blocks, on_done, ctx, nullptr);
+        return plugin_->apiExportRegion(name, x1, y1, z1, x2, y2, z2, dimension, include_entities, include_blocks,
+                                        out_dir, tp_player, force_bundle, on_done, ctx, nullptr);
     }
-    // v2: custom output dir + explicit TP player + bundle control. tp_player
-    // names the ONLY player the job may teleport (dimensioned exports and
-    // chunk-load assist); nullptr/"" disables teleport assist entirely.
-    std::uint64_t exportRegionTo(const char *name, int x1, int y1, int z1, int x2, int y2, int z2,
-                                 const char *dimension, bool include_entities, bool include_blocks,
-                                 const char *out_dir, const char *tp_player, bool force_bundle,
-                                 void (*on_done)(void *ctx, int stage, const char *message), void *ctx) override
-    {
-        if (name == nullptr) {
-            return 0;
-        }
-        return plugin_->apiExportRegionTo(name, x1, y1, z1, x2, y2, z2, dimension, include_entities,
-                                          include_blocks, out_dir, tp_player, force_bundle, on_done, ctx, nullptr);
-    }
-    // v2: place a structure (or bundle) into the world. original=true restores
+    // Place a structure (or bundle) into the world. original=true restores
     // a bundle at its exported position/dimension (cross-server migration).
     std::uint64_t placeStructure(const char *name, int x, int y, int z, bool original, const char *dimension,
                                  bool include_entities, bool include_blocks, const char *tp_player,
@@ -4639,7 +4143,7 @@ public:
     {
         auto items = plugin_->collectStructures();
         StructureManager *manager = nullptr;
-        if (plugin_->gate_ == GateState::Available) {
+        {
             int stage = STAGE_OK;
             manager = StructBridgePlugin::getManager(plugin_->getServer(), stage);
         }
@@ -4667,7 +4171,7 @@ public:
         std::vector<ListItem> out;
         auto items = plugin_->collectStructures();
         StructureManager *manager = nullptr;
-        if (plugin_->gate_ == GateState::Available) {
+        {
             int stage = STAGE_OK;
             manager = StructBridgePlugin::getManager(plugin_->getServer(), stage);
         }
@@ -4688,14 +4192,6 @@ public:
             out.push_back(std::move(li));
         }
         return out;
-    }
-    [[nodiscard]] int probeStage() const
-    {
-        return plugin_->probe_stage_;
-    }
-    [[nodiscard]] const char *probeDetail() const
-    {
-        return plugin_->probe_detail_.c_str();
     }
     [[nodiscard]] int structureCount() const
     {
@@ -4722,17 +4218,11 @@ public:
         return plugin_->apiDelete(name_or_null, msg);
     }
     std::uint64_t exportRegionPy(const std::string &name, int x1, int y1, int z1, int x2, int y2, int z2,
-                                 const char *dimension, bool entities, bool blocks, void *py_cb)
+                                 const char *dimension, bool entities, bool blocks, const char *out_dir,
+                                 const char *tp_player, bool force_bundle, void *py_cb)
     {
-        return plugin_->apiExportRegion(name, x1, y1, z1, x2, y2, z2, dimension, entities, blocks, nullptr,
-                                        nullptr, py_cb);
-    }
-    std::uint64_t exportRegionToPy(const std::string &name, int x1, int y1, int z1, int x2, int y2, int z2,
-                                   const char *dimension, bool entities, bool blocks, const char *out_dir,
-                                   const char *tp_player, bool force_bundle, void *py_cb)
-    {
-        return plugin_->apiExportRegionTo(name, x1, y1, z1, x2, y2, z2, dimension, entities, blocks, out_dir,
-                                          tp_player, force_bundle, nullptr, nullptr, py_cb);
+        return plugin_->apiExportRegion(name, x1, y1, z1, x2, y2, z2, dimension, entities, blocks, out_dir,
+                                        tp_player, force_bundle, nullptr, nullptr, py_cb);
     }
     std::uint64_t placeStructurePy(const std::string &name, int x, int y, int z, bool original,
                                    const char *dimension, bool entities, bool blocks, const char *tp_player,
@@ -4740,10 +4230,6 @@ public:
     {
         return plugin_->apiPlaceStructure(name, x, y, z, original, dimension, entities, blocks, tp_player, nullptr,
                                           nullptr, py_cb);
-    }
-    void rerunProbe()
-    {
-        plugin_->runProbe(true);
     }
 #endif  // STRUCTBRIDGE_PYTHON_API
 
@@ -4813,19 +4299,9 @@ PyObject *status(PyObject *, PyObject *)
     if (api() == nullptr) {
         Py_RETURN_NONE;
     }
-    return Py_BuildValue("{s:O,s:i,s:s,s:s,s:i,s:i}", "available", api()->isAvailable() ? Py_True : Py_False,
-                         "probe_stage", api()->probeStage(), "probe_detail", api()->probeDetail(), "version",
+    return Py_BuildValue("{s:O,s:s,s:i,s:i}", "available", api()->isAvailable() ? Py_True : Py_False, "version",
                          api()->version(), "api_version", STRUCTBRIDGE_API_VERSION, "structures",
                          api()->structureCount());
-}
-
-PyObject *probe(PyObject *, PyObject *)
-{
-    if (api() == nullptr) {
-        return apiNotReady();
-    }
-    api()->rerunProbe();  // asynchronous; results land in the log and status()
-    Py_RETURN_NONE;
 }
 
 PyObject *import_structure(PyObject *, PyObject *args)
@@ -4925,55 +4401,6 @@ PyObject *export_region(PyObject *, PyObject *args, PyObject *kw)
     PyObject *dim = Py_None;
     PyObject *entities = Py_None;
     PyObject *blocks = Py_None;
-    PyObject *on_done = Py_None;
-    static const char *kwlist[] = {"name",       "x1",                "y1",      "z1",
-                                   "x2",         "y2",                "z2",      "dimension",
-                                   "include_entities", "include_blocks", "on_done", nullptr};
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "siiiiii|OOOO", const_cast<char **>(kwlist), &name, &x1, &y1, &z1,
-                                     &x2, &y2, &z2, &dim, &entities, &blocks, &on_done)) {
-        return nullptr;
-    }
-    if (api() == nullptr) {
-        return apiNotReady();
-    }
-    const char *dim_c = nullptr;
-    if (dim != Py_None) {
-        dim_c = PyUnicode_AsUTF8(dim);
-        if (dim_c == nullptr) {
-            return nullptr;
-        }
-    }
-    bool ent = api()->defaultEntities();
-    if (entities != Py_None) {
-        ent = PyObject_IsTrue(entities) == 1;
-    }
-    bool blk = api()->defaultBlocks();
-    if (blocks != Py_None) {
-        blk = PyObject_IsTrue(blocks) == 1;
-    }
-    void *py_cb = nullptr;
-    if (on_done != Py_None) {
-        if (!PyCallable_Check(on_done)) {
-            PyErr_SetString(PyExc_TypeError, "on_done must be callable or None");
-            return nullptr;
-        }
-        Py_INCREF(on_done);  // strong ref; finishExport() releases it after firing
-        py_cb = on_done;
-    }
-    const std::uint64_t job = api()->exportRegionPy(name, x1, y1, z1, x2, y2, z2, dim_c, ent, blk, py_cb);
-    if (job == 0 && py_cb != nullptr) {
-        Py_DECREF(on_done);  // job rejected - give the reference back
-    }
-    return PyLong_FromUnsignedLongLong(job);
-}
-
-PyObject *export_region_to(PyObject *, PyObject *args, PyObject *kw)
-{
-    const char *name = nullptr;
-    int x1 = 0, y1 = 0, z1 = 0, x2 = 0, y2 = 0, z2 = 0;
-    PyObject *dim = Py_None;
-    PyObject *entities = Py_None;
-    PyObject *blocks = Py_None;
     PyObject *out_dir = Py_None;
     PyObject *tp_player = Py_None;
     PyObject *force_bundle = Py_False;
@@ -5030,7 +4457,7 @@ PyObject *export_region_to(PyObject *, PyObject *args, PyObject *kw)
         py_cb = on_done;
     }
     const std::uint64_t job =
-        api()->exportRegionToPy(name, x1, y1, z1, x2, y2, z2, dim_c, ent, blk, out_c, tp_c, bundle, py_cb);
+        api()->exportRegionPy(name, x1, y1, z1, x2, y2, z2, dim_c, ent, blk, out_c, tp_c, bundle, py_cb);
     if (job == 0 && py_cb != nullptr) {
         Py_DECREF(on_done);
     }
@@ -5097,11 +4524,10 @@ PyObject *place_structure(PyObject *, PyObject *args, PyObject *kw)
 
 PyMethodDef methods[] = {
     {"api_version", api_version, METH_NOARGS, "Return the C ABI version this plugin exports."},
-    {"is_available", is_available, METH_NOARGS, "True if the startup compatibility probe passed."},
+    {"is_available", is_available, METH_NOARGS, "True when the plugin is loaded and operational."},
     {"plugin_version", plugin_version, METH_NOARGS, "Plugin version string."},
     {"stage_message", stage_message, METH_VARARGS, "stage_message(stage) -> human-readable stage name."},
     {"status", status, METH_NOARGS, "Overall status dict."},
-    {"probe", probe, METH_NOARGS, "Re-run the native compatibility probe (async)."},
     {"import_structure", import_structure, METH_VARARGS, "import_structure(name_or_path) -> result dict."},
     {"dump_structure", dump_structure, METH_VARARGS, "dump_structure(name) -> result dict."},
     {"delete_structure", delete_structure, METH_VARARGS,
@@ -5112,13 +4538,10 @@ PyMethodDef methods[] = {
     {"export_region", reinterpret_cast<PyCFunction>(reinterpret_cast<void *>(export_region)),
      METH_VARARGS | METH_KEYWORDS,
      "export_region(name, x1,y1,z1, x2,y2,z2, dimension=None, include_entities=None, include_blocks=None, "
-     "on_done=None) -> job id (0 = rejected). on_done(stage:int, message:str) fires on the server thread."},
-    {"export_region_to", reinterpret_cast<PyCFunction>(reinterpret_cast<void *>(export_region_to)),
-     METH_VARARGS | METH_KEYWORDS,
-     "export_region_to(name, x1,y1,z1, x2,y2,z2, dimension=None, include_entities=None, include_blocks=None, "
-     "out_dir=None, tp_player=None, force_bundle=False, on_done=None) -> job id. out_dir: custom output directory "
-     "(absolute, or relative to the server root). tp_player: the ONLY player the job may teleport for chunk "
-     "loading (required for non-overworld exports). force_bundle: always emit a .bundle even for small regions."},
+     "out_dir=None, tp_player=None, force_bundle=False, on_done=None) -> job id (0 = rejected). out_dir: custom "
+     "output directory (absolute, or relative to the server root). tp_player: the ONLY player the job may "
+     "teleport for chunk loading (required for non-overworld exports). force_bundle: always emit a .bundle even "
+     "for small regions. on_done(stage:int, message:str) fires on the server thread."},
     {"place_structure", reinterpret_cast<PyCFunction>(reinterpret_cast<void *>(place_structure)),
      METH_VARARGS | METH_KEYWORDS,
      "place_structure(name, x, y, z, original=False, dimension=None, include_entities=None, include_blocks=None, "
@@ -5174,9 +4597,9 @@ extern "C" STRUCTBRIDGE_EXPORT structbridge::IApi *structbridge_get_api(void)
     return structbridge::g_api_instance;
 }
 
-ENDSTONE_PLUGIN("structbridge", "0.1.0", structbridge::StructBridgePlugin)
+ENDSTONE_PLUGIN("structbridge", "0.1.1", structbridge::StructBridgePlugin)
 {
-    description = "Server-side export/import of official .mcstructure files, with a crash-safe native probe.";
+    description = "Server-side export/import of official .mcstructure files.";
     website = "https://github.com/gxh6438/structbridge";
     authors = {"gxh6438"};
     prefix = "StructBridge";
@@ -5188,20 +4611,6 @@ ENDSTONE_PLUGIN("structbridge", "0.1.0", structbridge::StructBridgePlugin)
     // the subcommand's own arguments (split in onCommand).
     command("struct")
         .description("Structure toolkit: export/import/place/delete official .mcstructure files and .bundle bundles")
-        .usages("/struct (export|import|place|dump|list|delete|clear|status|probe|api)[action: StructAction] "
+        .usages("/struct (export|import|place|dump|list|delete|clear|status|api)[action: StructAction] "
                 "[args: message]");
-    // Legacy /structxxx aliases - deprecated, removed in the next release.
-    command("structexport")
-        .description("Deprecated: use /struct export")
-        .usages("/structexport <name: string> <x1: int> <y1: int> <z1: int> <x2: int> <y2: int> <z2: int> "
-                "[entities: bool] [blocks: bool]");
-    command("structimport")
-        .description("Deprecated: use /struct import")
-        .usages("/structimport <file: message>");
-    command("structdump").description("Deprecated: use /struct dump").usages("/structdump <name: message>");
-    command("structdelete").description("Deprecated: use /struct delete").usages("/structdelete [name: message]");
-    command("structlist").description("Deprecated: use /struct list").usages("/structlist");
-    command("structprobe").description("Deprecated: use /struct probe").usages("/structprobe");
-    command("structstatus").description("Deprecated: use /struct status").usages("/structstatus");
-    command("structapi").description("Deprecated: use /struct api").usages("/structapi");
 }
