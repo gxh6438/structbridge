@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "endstone-probe"
+version = "0.0.1"
+
+[project.entry-points."endstone"]
+probe = "probe_plugin:ProbePlugin"
