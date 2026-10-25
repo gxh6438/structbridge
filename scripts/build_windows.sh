@@ -11,13 +11,18 @@
 # structbridge additionally includes Endstone's INTERNAL headers (src/) for
 # EndstoneLevel/EndstoneServer and the native Level/Tag/IDataOutput shims,
 # so the same dependency surface as the Linux build applies (RakNet shims,
-# entt flags, cpptrace stub, boost/glm from the host include path).
+# entt flags, cpptrace stub, plus the header-only deps gsl/boost/glm).
+#
+# The host header-only deps come from the system include dir (on the CI
+# runner: libmsgsl-dev / libboost-dev / libglm-dev) passed as -isystem, so
+# they rank BELOW every MSVC CRT/SDK -I path and never shadow e.g. stdio.h.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENDSTONE_SRC="${ENDSTONE_SRC:-/workspace/endstone/src}"
 ENDSTONE_INC="${ENDSTONE_INC:-/workspace/endstone/include}"
 MSVC="${MSVC:-/opt/msvc}"
+HOST_INC="${HOST_INC:-/usr/include}"
 CLANG_CL="${CLANG_CL:-$(command -v clang-cl-19 || echo /usr/local/bin/clang-cl-19)}"
 export PATH="/usr/lib/llvm-19/bin:${PATH}"
 OUT="${ROOT}/dist/endstone_structbridge.dll"
@@ -167,7 +172,7 @@ cd "${ROOT}"
     /I"${ENDSTONE_SRC}" \
     /I"${ENDSTONE_INC}" \
     /I"${GEN_INC}" \
-    /I"${ROOT}/vendor/host-includes" \
+    -isystem "${HOST_INC}" \
     /I"${MSVC}/crt/include" \
     /I"${MSVC}/sdk/include/um" \
     /I"${MSVC}/sdk/include/ucrt" \
