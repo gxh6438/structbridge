@@ -13,6 +13,16 @@
 // The build must define Py_NO_ENABLE_SHARED so pyport.h keeps plain extern
 // declarations (no dllimport, no #pragma comment(lib) auto-link).
 
+// Keep the Windows.h include clean: LEAN_AND_MEAN excludes winsock1 and
+// rpc.h (their sockaddr / interface macros would collide with WinSock2.h
+// and C++ code included later), NOMINMAX keeps the min/max macros away
+// from std::min / std::max.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <Windows.h>
 #include <TlHelp32.h>
 
@@ -39,6 +49,7 @@ inline PyObject *(*PyLong_FromUnsignedLongLong)(unsigned long long) = nullptr;
 inline PyObject *(*PyModule_Create2)(PyModuleDef *, int) = nullptr;
 inline PyObject *(*PyObject_CallObject)(PyObject *, PyObject *) = nullptr;
 inline int (*PyObject_IsTrue)(PyObject *) = nullptr;
+inline const char *(*PyUnicode_AsUTF8)(PyObject *) = nullptr;
 inline PyObject *(*PyUnicode_FromString)(const char *) = nullptr;
 
 // Data symbols. _Py_NoneStruct & co. are PyObject instances, PyExc_* are
@@ -47,6 +58,7 @@ inline PyObject *(*PyUnicode_FromString)(const char *) = nullptr;
 inline PyObject *p_Py_NoneStruct = nullptr;
 inline PyObject *p_Py_TrueStruct = nullptr;
 inline PyObject *p_Py_FalseStruct = nullptr;
+inline void (*p_Py_Dealloc)(PyObject *) = nullptr;
 inline PyObject **pp_PyExc_RuntimeError = nullptr;
 inline PyObject **pp_PyExc_TypeError = nullptr;
 
@@ -118,11 +130,15 @@ inline bool init()
     PYRT_RESOLVE(PyModule_Create2);
     PYRT_RESOLVE(PyObject_CallObject);
     PYRT_RESOLVE(PyObject_IsTrue);
+    PYRT_RESOLVE(PyUnicode_AsUTF8);
     PYRT_RESOLVE(PyUnicode_FromString);
 
     PYRT_RESOLVE_DATA(p_Py_NoneStruct, "_Py_NoneStruct");
     PYRT_RESOLVE_DATA(p_Py_TrueStruct, "_Py_TrueStruct");
     PYRT_RESOLVE_DATA(p_Py_FalseStruct, "_Py_FalseStruct");
+    // Called by the inline Py_DECREF/Py_XDECREF bodies in Python.h; see the
+    // forwarding definition below the macro redirects.
+    PYRT_RESOLVE_DATA(p_Py_Dealloc, "_Py_Dealloc");
     PYRT_RESOLVE_DATA(pp_PyExc_RuntimeError, "PyExc_RuntimeError");
     PYRT_RESOLVE_DATA(pp_PyExc_TypeError, "PyExc_TypeError");
 
@@ -156,6 +172,7 @@ inline bool init()
 #define PyModule_Create2 ::structbridge::pyrt::PyModule_Create2
 #define PyObject_CallObject ::structbridge::pyrt::PyObject_CallObject
 #define PyObject_IsTrue ::structbridge::pyrt::PyObject_IsTrue
+#define PyUnicode_AsUTF8 ::structbridge::pyrt::PyUnicode_AsUTF8
 #define PyUnicode_FromString ::structbridge::pyrt::PyUnicode_FromString
 
 #define _Py_NoneStruct (*::structbridge::pyrt::p_Py_NoneStruct)
@@ -163,3 +180,17 @@ inline bool init()
 #define _Py_FalseStruct (*::structbridge::pyrt::p_Py_FalseStruct)
 #define PyExc_RuntimeError (*::structbridge::pyrt::pp_PyExc_RuntimeError)
 #define PyExc_TypeError (*::structbridge::pyrt::pp_PyExc_TypeError)
+
+// The inline Py_DECREF/Py_XDECREF bodies in Python.h call the external
+// _Py_Dealloc(PyObject*) - a macro redirect cannot rewrite an inline body
+// that was already parsed when Python.h was included. This local definition
+// satisfies the linker and forwards to the runtime-resolved original. It is
+// unreachable when init() failed (no Python code runs without a resolved
+// interpreter); the null check is defensive only. Keep this header included
+// from exactly one translation unit.
+extern "C" void _Py_Dealloc(PyObject *op)
+{
+    if (::structbridge::pyrt::p_Py_Dealloc != nullptr) {
+        ::structbridge::pyrt::p_Py_Dealloc(op);
+    }
+}

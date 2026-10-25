@@ -49,9 +49,11 @@
 #include <string>
 #include <vector>
 
-// Python API: enabled automatically when Python headers are reachable (the
+// Python API: enabled automatically when Python headers are reachable. The
 // Linux build passes the interpreter's include dir; the Windows cross-build
-// gets the headers of the host distribution plus CPython's MSVC pyconfig.h).
+// compiles against the vendored CPython headers in vendor/python-win/ (the
+// platform-independent set plus CPython's MSVC pyconfig.h - distro pyconfig
+// headers are multiarch dispatchers that do not compile for MSVC targets).
 // On Windows the plugin links NO python3xx import library: the C API entry
 // points are resolved at runtime from the interpreter DLL the Endstone host
 // already loaded (py_runtime_win32.h), so a second interpreter instance is
@@ -59,9 +61,15 @@
 #if __has_include(<Python.h>)
 #define STRUCTBRIDGE_PYTHON_API 1
 #if defined(_WIN32)
-// Occupy the Py_CONFIG_H guard with the MSVC-targeted configuration so the
-// Linux pyconfig.h shipped next to Python.h is suppressed.
-#include "python-win/pyconfig.h"
+// Before ANY Windows header include (Python.h may pull Windows.h): LEAN_AND_MEAN
+// keeps winsock1/rpc.h out (they collide with WinSock2.h via the RakNet shim),
+// NOMINMAX keeps the min/max macros away from std::min/std::max.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #endif
 #include <Python.h>  // in-process "structbridge" module for Python plugins
 #if defined(_WIN32)
