@@ -14,8 +14,10 @@
 # entt flags, cpptrace stub, plus the header-only deps gsl/boost/glm).
 #
 # The host header-only deps come from the system include dir (on the CI
-# runner: libmsgsl-dev / libboost-dev / libglm-dev) passed as -isystem, so
-# they rank BELOW every MSVC CRT/SDK -I path and never shadow e.g. stdio.h.
+# runner: libmsgsl-dev / libboost-dev / libglm-dev). clang-cl rejects the
+# -isystem flag, so the dir is passed as /I AFTER every MSVC CRT/SDK path:
+# the search order then guarantees MSVC headers always win (e.g. stdio.h),
+# while gsl/boost/glm - absent from the CRT/SDK - resolve to the host copy.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -172,13 +174,13 @@ cd "${ROOT}"
     /I"${ENDSTONE_SRC}" \
     /I"${ENDSTONE_INC}" \
     /I"${GEN_INC}" \
-    -isystem "${HOST_INC}" \
     /I"${MSVC}/crt/include" \
     /I"${MSVC}/sdk/include/um" \
     /I"${MSVC}/sdk/include/ucrt" \
     /I"${MSVC}/sdk/include/shared" \
     /I"${MSVC}/sdk/include/winrt" \
     /I"${MSVC}/sdk/include/cppwinrt" \
+    /I"${HOST_INC}" \
     -fuse-ld=lld-link \
     src/structbridge.cpp \
     src/leveldb_scan.cpp \
