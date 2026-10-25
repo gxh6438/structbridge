@@ -25,6 +25,9 @@ ENDSTONE_SRC="${ENDSTONE_SRC:-/workspace/endstone/src}"
 ENDSTONE_INC="${ENDSTONE_INC:-/workspace/endstone/include}"
 MSVC="${MSVC:-/opt/msvc}"
 HOST_INC="${HOST_INC:-/usr/include}"
+# Python headers for the in-process module. Only declarations are used - the
+# plugin resolves the C API at runtime and links no python3xx import library.
+PY_INC="${PY_INC:-}"
 CLANG_CL="${CLANG_CL:-$(command -v clang-cl-19 || echo /usr/local/bin/clang-cl-19)}"
 export PATH="/usr/lib/llvm-19/bin:${PATH}"
 OUT="${ROOT}/dist/endstone_structbridge.dll"
@@ -160,6 +163,11 @@ EOF
 # /workspace/... would be silently consumed as an option instead of an input.
 cd "${ROOT}"
 
+PY_FLAGS=()
+if [ -n "${PY_INC}" ]; then
+    PY_FLAGS+=(/I"${PY_INC}")
+fi
+
 "${CLANG_CL}" \
     /nologo /std:c++20 /EHsc /O2 /MD /LD \
     /W3 \
@@ -167,6 +175,7 @@ cd "${ROOT}"
     -DENTT_SPARSE_PAGE=2048 \
     -DENTT_NO_MIXIN \
     -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH \
+    -DPy_NO_ENABLE_SHARED \
     /I"${ROOT}/vendor" \
     /I"${ROOT}/vendor/entt" \
     /I"${ROOT}/src" \
@@ -181,6 +190,7 @@ cd "${ROOT}"
     /I"${MSVC}/sdk/include/winrt" \
     /I"${MSVC}/sdk/include/cppwinrt" \
     /I"${HOST_INC}" \
+    "${PY_FLAGS[@]}" \
     -fuse-ld=lld-link \
     src/structbridge.cpp \
     src/leveldb_scan.cpp \

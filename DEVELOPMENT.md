@@ -124,7 +124,7 @@ endstone 运行时不导出内部符号，插件必须自包含。StructureTempl
 
 `include/structbridge_api.h`：纯虚接口 + `extern "C"` 工厂函数，边界上只有 POD 类型（`const char*`、整数、函数指针），libstdc++ 消费方无需重编。Python 模块在 onLoad 时注入 sys.modules，回调挂在导出/放置任务上，在服务器线程触发；PyObject 的引用计数操作全部放在 GIL 区间内。
 
-Windows 版本目前不编入 Python 模块：交叉编译环境没有 Python 头文件，而且链接特定的 python3xx.dll 会在进程里出现第二个解释器实例。C++ 接口不受影响。
+Windows 版本的 Python 模块不链接任何 python3xx 导入库：构建时只使用 CPython 头文件（含 MSVC 版 `pyconfig.h`，置于 `vendor/python-win/`），运行时通过 `py_runtime_win32.h` 从宿主进程已加载的解释器 DLL 解析全部 C API 入口。因此不会出现第二个解释器实例；找不到兼容解释器时仅跳过模块注册，C++ 接口不受影响。
 
 ### 命令注册
 

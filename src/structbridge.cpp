@@ -50,13 +50,23 @@
 #include <vector>
 
 // Python API: enabled automatically when Python headers are reachable (the
-// Linux build passes the interpreter's include dir). The Windows cross-build
-// has no Python headers, and linking a specific python3xx.dll would risk a
-// second interpreter instance, so the module is compiled out there - the C++
-// API stays fully available.
+// Linux build passes the interpreter's include dir; the Windows cross-build
+// gets the headers of the host distribution plus CPython's MSVC pyconfig.h).
+// On Windows the plugin links NO python3xx import library: the C API entry
+// points are resolved at runtime from the interpreter DLL the Endstone host
+// already loaded (py_runtime_win32.h), so a second interpreter instance is
+// impossible and a missing interpreter merely disables the Python module.
 #if __has_include(<Python.h>)
 #define STRUCTBRIDGE_PYTHON_API 1
+#if defined(_WIN32)
+// Occupy the Py_CONFIG_H guard with the MSVC-targeted configuration so the
+// Linux pyconfig.h shipped next to Python.h is suppressed.
+#include "python-win/pyconfig.h"
+#endif
 #include <Python.h>  // in-process "structbridge" module for Python plugins
+#if defined(_WIN32)
+#include "py_runtime_win32.h"  // runtime resolution + macro redirects (last!)
+#endif
 #endif
 
 #include <nlohmann/json.hpp>
@@ -1031,7 +1041,7 @@ private:
 class ApiImpl;
 ApiImpl *g_api_instance = nullptr;               // created in onLoad, alive for the process
 ApiImpl *createApiImpl(StructBridgePlugin *plugin);  // defined next to ApiImpl
-constexpr const char *kPluginVersion = "0.0.2";  // single source of the plugin version
+constexpr const char *kPluginVersion = "0.0.3";  // single source of the plugin version
 
 // ---------------------------------------------------------------------------
 // Config
@@ -4693,6 +4703,16 @@ PyModuleDef module_def = {
 
 void StructBridgePlugin::registerPythonModule()
 {
+#if defined(_WIN32)
+    // Resolve the C API from the interpreter DLL the host already loaded.
+    // Without an embedded interpreter the module is skipped; the C++ API
+    // stays fully available either way.
+    if (!pyrt::init()) {
+        getLogger().info("Python API unavailable: no compatible embedded interpreter found "
+                         "(the C++ API stays available).");
+        return;
+    }
+#endif
     PyGILState_STATE gil = PyGILState_Ensure();
     PyObject *mod = PyModule_Create(&pyapi::module_def);
     if (mod == nullptr) {
