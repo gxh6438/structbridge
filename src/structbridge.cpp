@@ -35,6 +35,7 @@
 // defines the referenced bedrock-shim constructors locally (see below).
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -762,6 +763,17 @@ struct BundleManifest {
     }
 };
 
+// Sidecar metadata for a single exported structure, stored as meta.json next
+// to the .mcstructure file inside the per-structure library folder. This is
+// what makes "/struct place <name> original" work for single structures the
+// same way the bundle manifest does for bundles.
+struct StructureMeta {
+    int format = 1;
+    std::string name;           // bare name, e.g. "myhouse"
+    std::string dimension;      // "overworld" | "nether" | "the_end"
+    int x1 = 0, y1 = 0, z1 = 0, x2 = 0, y2 = 0, z2 = 0;  // exported region
+};
+
 // The pre-teleport position of a job's designated player, recorded before the
 // FIRST teleport and restored when the job finishes (success, failure or
 // abort) - the player is only ever moved to load chunks, never left behind.
@@ -777,6 +789,7 @@ struct ExportJob {
     int x1 = 0, y1 = 0, z1 = 0, x2 = 0, y2 = 0, z2 = 0;
     bool entities = true;
     bool blocks = true;
+    std::string dimension;                 // recorded into the meta sidecar
     bool via_player = false;
     std::string player_name;               // only valid when via_player
     // Player who may be teleported to help load chunks. This is the player
@@ -990,7 +1003,25 @@ private:
     std::chrono::steady_clock::time_point clear_pending_at_;
 
     static bool isValidStructureName(const std::string &name);
-    static fs::path sanitizeRelativePath(const std::string &name);
+    // Split "ns:local"/"local" into cleaned namespace + local name (the
+    // shared cleaning core of the two path helpers below).
+    static void splitStructureName(const std::string &name, std::string &ns, std::string &local);
+    // Library layout (0.0.2+): library/<ns>/<name>/<name>.mcstructure plus a
+    // meta.json sidecar in the same folder.
+    [[nodiscard]] static fs::path libraryRelativePath(const std::string &name);
+    // Behavior-pack mirror layout (engine requirement, flat):
+    // structures/<ns>/<name>.mcstructure
+    [[nodiscard]] static fs::path packRelativePath(const std::string &name);
+
+    // meta.json sidecar next to the library structure file.
+    [[nodiscard]] fs::path structureDirInLibrary(const std::string &name) const;
+    [[nodiscard]] bool writeStructureMeta(const std::string &name, const StructureMeta &meta);
+    [[nodiscard]] std::shared_ptr<StructureMeta> readStructureMeta(const std::string &name) const;
+
+    // Remove the plugin-managed on-disk copies of one structure: the library
+    // folder (structure + meta.json) and the pack mirror. Returns how many
+    // filesystem entries were removed.
+    int removeStructureFiles(const std::string &ns, const std::string &local);
 
     friend class ApiImpl;
 };
@@ -1000,7 +1031,7 @@ private:
 class ApiImpl;
 ApiImpl *g_api_instance = nullptr;               // created in onLoad, alive for the process
 ApiImpl *createApiImpl(StructBridgePlugin *plugin);  // defined next to ApiImpl
-constexpr const char *kPluginVersion = "0.0.1";  // single source of the plugin version
+constexpr const char *kPluginVersion = "0.0.2";  // single source of the plugin version
 
 // ---------------------------------------------------------------------------
 // Config
@@ -1247,12 +1278,11 @@ bool StructBridgePlugin::isValidStructureName(const std::string &name)
     return true;
 }
 
-fs::path StructBridgePlugin::sanitizeRelativePath(const std::string &name)
+void StructBridgePlugin::splitStructureName(const std::string &name, std::string &ns, std::string &local)
 {
-    std::string ns = "mystructure";
-    std::string local = name;
-    auto pos = name.find(':');
-    if (pos != std::string::npos) {
+    ns = "mystructure";
+    local = name;
+    if (auto pos = name.find(':'); pos != std::string::npos) {
         ns = name.substr(0, pos);
         local = name.substr(pos + 1);
     }
@@ -1300,15 +1330,109 @@ fs::path StructBridgePlugin::sanitizeRelativePath(const std::string &name)
         }
         return out;
     };
-    std::string safe_ns = clean(ns);
-    std::string safe_local = clean(local);
-    if (safe_ns.empty()) {
-        safe_ns = "mystructure";
+    ns = clean(ns);
+    local = clean(local);
+    if (ns.empty()) {
+        ns = "mystructure";
     }
-    if (safe_local.empty()) {
-        safe_local = "structure";
+    if (local.empty()) {
+        local = "structure";
     }
-    return pathFromUtf8(safe_ns) / pathFromUtf8(safe_local + ".mcstructure");
+}
+
+fs::path StructBridgePlugin::libraryRelativePath(const std::string &name)
+{
+    std::string ns;
+    std::string local;
+    splitStructureName(name, ns, local);
+    return pathFromUtf8(ns) / pathFromUtf8(local) / pathFromUtf8(local + ".mcstructure");
+}
+
+fs::path StructBridgePlugin::packRelativePath(const std::string &name)
+{
+    std::string ns;
+    std::string local;
+    splitStructureName(name, ns, local);
+    return pathFromUtf8(ns) / pathFromUtf8(local + ".mcstructure");
+}
+
+fs::path StructBridgePlugin::structureDirInLibrary(const std::string &name) const
+{
+    std::string ns;
+    std::string local;
+    splitStructureName(name, ns, local);
+    return libraryDir() / pathFromUtf8(ns) / pathFromUtf8(local);
+}
+
+bool StructBridgePlugin::writeStructureMeta(const std::string &name, const StructureMeta &meta)
+{
+    std::string ns;
+    std::string local;
+    splitStructureName(name, ns, local);
+    json j;
+    j["format"] = meta.format;
+    j["name"] = local;
+    j["dimension"] = meta.dimension.empty() ? "overworld" : meta.dimension;
+    j["region"] = {meta.x1, meta.y1, meta.z1, meta.x2, meta.y2, meta.z2};
+    const fs::path dir = structureDirInLibrary(name);
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    std::ofstream out(dir / "meta.json", std::ios::trunc);
+    if (!out) {
+        return false;
+    }
+    out << j.dump(2) << std::endl;
+    return out.good();
+}
+
+std::shared_ptr<StructureMeta> StructBridgePlugin::readStructureMeta(const std::string &name) const
+{
+    std::ifstream in(structureDirInLibrary(name) / "meta.json");
+    if (!in) {
+        return nullptr;
+    }
+    try {
+        json j;
+        in >> j;
+        auto meta = std::make_shared<StructureMeta>();
+        if (!j.contains("region") || !j["region"].is_array() || j["region"].size() != 6) {
+            return nullptr;
+        }
+        for (int i = 0; i < 6; ++i) {
+            if (!j["region"][i].is_number_integer()) {
+                return nullptr;
+            }
+        }
+        meta->name = j.value("name", "");
+        meta->dimension = j.value("dimension", "overworld");
+        const auto r = j["region"].get<std::array<int, 6>>();
+        meta->x1 = r[0];
+        meta->y1 = r[1];
+        meta->z1 = r[2];
+        meta->x2 = r[3];
+        meta->y2 = r[4];
+        meta->z2 = r[5];
+        return meta;
+    }
+    catch (const std::exception &) {
+        return nullptr;
+    }
+}
+
+int StructBridgePlugin::removeStructureFiles(const std::string &ns, const std::string &local)
+{
+    int removed = 0;
+    std::error_code ec;
+    const fs::path folder = libraryDir() / pathFromUtf8(ns) / pathFromUtf8(local);
+    if (fs::exists(folder, ec) && fs::remove_all(folder, ec) > 0) {
+        ++removed;
+    }
+    ec.clear();
+    const fs::path mirror = packStructuresDir() / pathFromUtf8(ns) / pathFromUtf8(local + ".mcstructure");
+    if (fs::exists(mirror, ec) && fs::remove(mirror, ec)) {
+        ++removed;
+    }
+    return removed;
 }
 
 // ---------------------------------------------------------------------------
@@ -1385,8 +1509,7 @@ void StructBridgePlugin::syncExportsToPack()
             continue;
         }
         // First path component = namespace folder (bare names live under
-        // mystructure/; the legacy layout used default/ - map it). Deeper
-        // components keep their sub-path.
+        // mystructure/). Deeper components keep their sub-path.
         std::string ns = "mystructure";
         fs::path rest;
         bool first = true;
@@ -1404,9 +1527,6 @@ void StructBridgePlugin::syncExportsToPack()
             ns = "mystructure";
             rest = rel;
         }
-        if (ns == "default") {
-            ns = "mystructure";
-        }
         // Bundle tiles live at mystructure/<name>.bundle/tile_rXcY.mcstructure
         // but their ENGINE key is mystructure:<name>__tile_rXcY - mirror them
         // at the flat key-compatible name so the engine's own pack scan can
@@ -1421,6 +1541,14 @@ void StructBridgePlugin::syncExportsToPack()
             }
         }
         fs::path flat_rest = rest;
+        // Per-structure library folders (<ns>/<name>/<name>.mcstructure)
+        // mirror at the flat engine-key-compatible name.
+        {
+            const fs::path parent = rest.parent_path();
+            if (!parent.empty() && parent.parent_path().empty() && rest.stem() == parent.filename()) {
+                flat_rest = rest.filename();
+            }
+        }
         if (in_bundle) {
             flat_rest = pathFromUtf8(bundle_name + "__" + pathToUtf8(rest.filename()));
         }
@@ -1881,8 +2009,8 @@ void StructBridgePlugin::exportTick(std::shared_ptr<ExportJob> job)
                     // Custom output dir (API): write only there.
                     // Default: the plugin library + behavior-pack mirror.
                     const fs::path out_file = job->out_dir.empty()
-                                                  ? libraryDir() / sanitizeRelativePath(job->name)
-                                                  : job->out_dir / sanitizeRelativePath(job->name);
+                                                  ? libraryDir() / libraryRelativePath(job->name)
+                                                  : job->out_dir / libraryRelativePath(job->name);
                     std::error_code ec;
                     fs::create_directories(out_file.parent_path(), ec);
                     std::ofstream f(out_file, std::ios::binary);
@@ -1891,11 +2019,23 @@ void StructBridgePlugin::exportTick(std::shared_ptr<ExportJob> job)
                                 static_cast<std::streamsize>(bytes.size()));
                         f.close();
                         if (f.good()) {
+                            // Sidecar meta (export region + dimension) enables
+                            // "/struct place <name> original" for this structure.
+                            StructureMeta meta;
+                            meta.name = job->name;
+                            meta.dimension = job->dimension;
+                            meta.x1 = job->x1;
+                            meta.y1 = job->y1;
+                            meta.z1 = job->z1;
+                            meta.x2 = job->x2;
+                            meta.y2 = job->y2;
+                            meta.z2 = job->z2;
+                            writeStructureMeta(job->name, meta);
                             if (job->out_dir.empty()) {
                                 // Mirror into the vanilla behavior pack so the name
                                 // stays usable after a restart without any plugin
                                 // memory pre-registration.
-                                writeStructureFile(packStructuresDir() / sanitizeRelativePath(job->name), bytes);
+                                writeStructureFile(packStructuresDir() / packRelativePath(job->name), bytes);
                             }
                             getLogger().info("Export '{}': {} bytes -> {}", job->name, bytes.size(),
                                              pathToUtf8(out_file));
@@ -2376,7 +2516,7 @@ void StructBridgePlugin::placeTick(std::shared_ptr<PlaceJob> job)
                 src = bdir / pathFromUtf8(job->bundle->tiles[job->tile_index].file);
             }
             else {
-                src = libraryDir() / sanitizeRelativePath(job->name);
+                src = libraryDir() / libraryRelativePath(job->name);
                 have_src = fs::is_regular_file(src);
             }
             if (have_src) {
@@ -2545,6 +2685,7 @@ void StructBridgePlugin::handleExport(endstone::CommandSender &sender, const std
     job->entities = entities;
     job->blocks = blocks;
     std::string dimension = "overworld";
+    job->dimension = dimension;  // updated below for player origins
     if (auto *player = sender.asPlayer()) {
         // Player origin: the vanilla command runs in the PLAYER's dimension.
         job->via_player = true;
@@ -2627,7 +2768,7 @@ void StructBridgePlugin::handleImport(endstone::CommandSender &sender, const std
                 maybe_bundle = true;
             }
         }
-        file = maybe_bundle ? bundleDirInLibrary(name) : libraryDir() / sanitizeRelativePath(name);
+        file = maybe_bundle ? bundleDirInLibrary(name) : libraryDir() / libraryRelativePath(name);
     }
     if (!isValidStructureName(name)) {
         sender.sendMessage("§c结构名称非法。");
@@ -2733,8 +2874,8 @@ void StructBridgePlugin::handleImport(endstone::CommandSender &sender, const std
     // behavior pack so the engine's own pack scan picks the name up on the
     // next start (lazy, zero plugin-side memory). The in-memory registration
     // above only covers the current session.
-    writeStructureFile(libraryDir() / sanitizeRelativePath(name), bytes);
-    writeStructureFile(packStructuresDir() / sanitizeRelativePath(name), bytes);
+    writeStructureFile(libraryDir() / libraryRelativePath(name), bytes);
+    writeStructureFile(packStructuresDir() / packRelativePath(name), bytes);
     sender.sendMessage("§a导入成功: {}。", name);
     getLogger().info("Imported '{}' ({} bytes) from {} into manager key '{}'", name, bytes.size(), pathToUtf8(file),
                      key);
@@ -2743,8 +2884,9 @@ void StructBridgePlugin::handleImport(endstone::CommandSender &sender, const std
 // ---------------------------------------------------------------------------
 // /struct place - place a structure (or a whole bundle) into the world:
 //   /struct place <name> <x> <y> <z> [entities] [blocks]
-//   /struct place <name> original [entities] [blocks]   (bundle: original
-//     position + dimension from the manifest - cross-server building import)
+//   /struct place <name> original [entities] [blocks]   (bundles: original
+//     position + dimension from the manifest; single structures: from the
+//     meta.json sidecar - the cross-server building migration path)
 // Chunk loading uses the same budget as exports (tickingareas, then TP of the
 // INITIATING player only - never anyone else, and never a random player).
 // ---------------------------------------------------------------------------
@@ -2755,7 +2897,7 @@ void StructBridgePlugin::handlePlace(endstone::CommandSender &sender, const std:
     }
     if (args.size() < 2) {
         sender.sendMessage("§e用法: /struct place <名称> <x> <y> <z> [entities] [blocks]");
-        sender.sendMessage("§e      /struct place <名称> original [entities] [blocks]  (结构束按原坐标/维度复原)");
+        sender.sendMessage("§e      /struct place <名称> original [entities] [blocks]  (按导出时原坐标/维度复原)");
         return;
     }
     std::string name = args[0];
@@ -2840,8 +2982,19 @@ void StructBridgePlugin::handlePlace(endstone::CommandSender &sender, const std:
         // behavior pack or the world database - otherwise fail fast instead
         // of spinning the retry timer.
         if (original) {
-            sender.sendMessage("§coriginal 仅支持结构束 (.bundle)。");
-            return;
+            // Restore position + dimension from the library sidecar meta;
+            // only plugin exports carry one.
+            auto meta = readStructureMeta(name);
+            if (meta == nullptr) {
+                sender.sendMessage("§c结构 '{}' 无原坐标记录 (仅插件导出的结构支持 original)。", name);
+                return;
+            }
+            job->x = meta->x1;
+            job->y = meta->y1;
+            job->z = meta->z1;
+            dimension = meta->dimension;
+            sender.sendMessage("§7按原坐标复原: ({}, {}, {}, {})", job->x, job->y, job->z,
+                               normalizeDimension(dimension));
         }
         const std::string full_key = name.find(':') == std::string::npos ? "mystructure:" + name : name;
         bool found = false;
@@ -2936,7 +3089,7 @@ void StructBridgePlugin::handleDump(endstone::CommandSender &sender, const std::
         return;
     }
 
-    auto out_file = libraryDir() / sanitizeRelativePath(name);
+    auto out_file = libraryDir() / libraryRelativePath(name);
     std::error_code ec;
     fs::create_directories(out_file.parent_path(), ec);
     {
@@ -2954,15 +3107,15 @@ void StructBridgePlugin::handleDump(endstone::CommandSender &sender, const std::
     }
     // Mirror into the vanilla behavior pack so the name stays loadable after
     // a restart (and remains available even without this plugin).
-    writeStructureFile(packStructuresDir() / sanitizeRelativePath(name), bytes);
+    writeStructureFile(packStructuresDir() / packRelativePath(name), bytes);
     sender.sendMessage("§a导出成功: {} ({} 字节)", pathToUtf8(out_file), bytes.size());
     getLogger().info("Dumped saved structure '{}' ({} bytes) to {}", name, bytes.size(), pathToUtf8(out_file));
 }
 
 // Collect every structure visible on this server, merged and deduplicated by
 // engine key across the three sources it can exist in:
-//   1. the plugin's exports library (any namespace folder; the legacy
-//      "default" maps to mystructure),
+//   1. the plugin's library: <ns>/<name>/<name>.mcstructure per-structure
+//      folders (bundle dirs are listed as units by collectBundles()),
 //   2. every behavior pack's structures/ dir - vanilla ships e.g. bastion:,
 //      minecraft:; the engine loads these lazily at level start. The mirror
 //      dirs some tools create (__brarchive/) are SIBLINGS of structures/, so
@@ -2991,10 +3144,11 @@ std::vector<StructBridgePlugin::LibItem> StructBridgePlugin::collectStructures()
     };
 
     // .mcstructure files under root. forced_ns empty -> the first path
-    // component is the namespace folder (the engine's pack layout:
-    // structures/<ns>/<rest>.mcstructure == key "<ns>:<rest>"); otherwise
-    // every file maps into forced_ns.
-    auto add_dir = [&](const fs::path &root, const std::string &forced_ns, bool library, bool mirror_root) {
+    // component is the namespace folder. library_layout expects the plugin's
+    // per-structure folders (<ns>/<name>/<name>.mcstructure); pack dirs use
+    // the engine's flat layout (structures/<ns>/<rest>.mcstructure).
+    auto add_dir = [&](const fs::path &root, const std::string &forced_ns, bool library, bool mirror_root,
+                       bool library_layout) {
         std::error_code ec;
         if (!fs::exists(root, ec)) {
             return;
@@ -3044,9 +3198,18 @@ std::vector<StructBridgePlugin::LibItem> StructBridgePlugin::collectStructures()
                     ns = "mystructure";
                     rest = rel;
                 }
-                if (ns == "default") {
-                    ns = "mystructure";  // legacy library layout
+            }
+            if (library_layout) {
+                // Only <ns>/<name>/<name>.mcstructure is a managed library
+                // entry; anything else in the library dir is ignored.
+                std::vector<fs::path> parts;
+                for (const auto &p : rest) {
+                    parts.push_back(p);
                 }
+                if (parts.size() != 2 || parts[0] != parts[1].stem()) {
+                    continue;
+                }
+                rest = parts[1];
             }
             std::string local = pathToUtf8(rest.replace_extension(""));
             if (local.empty()) {
@@ -3076,7 +3239,7 @@ std::vector<StructBridgePlugin::LibItem> StructBridgePlugin::collectStructures()
         }
     };
 
-    add_dir(libraryDir(), "", true, false);
+    add_dir(libraryDir(), "", true, false, true);
     {
         // every behavior pack (the vanilla one contains the plugin's mirror)
         std::error_code ec;
@@ -3086,7 +3249,7 @@ std::vector<StructBridgePlugin::LibItem> StructBridgePlugin::collectStructures()
                 continue;
             }
             const fs::path structs = pack.path() / "structures";
-            add_dir(structs, "", false, structs == packStructuresDir());
+            add_dir(structs, "", false, structs == packStructuresDir(), false);
         }
     }
     {
@@ -3265,18 +3428,8 @@ void StructBridgePlugin::handleDelete(endstone::CommandSender &sender, const std
         engine_gone = manager->getStructure(key) == nullptr;
     }
 
-    // Plugin files: library copy + pack mirror.
-    std::vector<fs::path> files = {
-        libraryDir() / "mystructure" / pathFromUtf8(local + ".mcstructure"),
-        packStructuresDir() / "mystructure" / pathFromUtf8(local + ".mcstructure"),
-    };
-    std::vector<std::string> removed;
-    std::error_code ec;
-    for (const auto &f : files) {
-        if (fs::exists(f, ec) && fs::remove(f, ec)) {
-            removed.push_back(pathToUtf8(f));
-        }
-    }
+    // Plugin files: library folder (structure + meta.json) + pack mirror.
+    const int removed = removeStructureFiles("mystructure", local);
 
     // Deterministic LevelDB re-check (read-only scan; the engine may batch
     // its writes, so a leftover entry is reported rather than hidden).
@@ -3297,13 +3450,13 @@ void StructBridgePlugin::handleDelete(endstone::CommandSender &sender, const std
         sender.sendMessage("§c删除失败: {} 仍存在于内存中。", key);
         return;
     }
-    if (removed.empty() && !had_in_memory && !still_in_db) {
+    if (removed == 0 && !had_in_memory && !still_in_db) {
         sender.sendMessage("§e结构 '{}' 未找到。", local);
         return;
     }
     sender.sendMessage("§a删除完成: '{}'。", local);
-    getLogger().info("Delete '{}': engine gone, db {}, {} plugin file(s) removed", local, still_in_db ? "left" : "gone",
-                     removed.size());
+    getLogger().info("Delete '{}': engine gone, db {}, {} plugin file entries removed", local,
+                     still_in_db ? "left" : "gone", removed);
 }
 
 // ---------------------------------------------------------------------------
@@ -3504,13 +3657,7 @@ void StructBridgePlugin::handleClear(endstone::CommandSender &sender, const std:
             getServer().dispatchCommand(getServer().getCommandSender(), "structure delete \"" + item.key + "\"");
         }
         ++structures;
-        for (const auto &f : {libraryDir() / pathFromUtf8(item.ns) / pathFromUtf8(item.local + ".mcstructure"),
-                              item.mirror}) {
-            if (fs::exists(f, ec) && fs::remove(f, ec)) {
-                ++files;
-            }
-            ec.clear();
-        }
+        files += removeStructureFiles(item.ns, item.local);
     }
     sender.sendMessage("§a清理完成: {} 个结构 + {} 个结构束 ({} 个文件)。", structures, bundles_deleted, files);
     getLogger().info("Clear-all: {} structures, {} bundles, {} files removed", structures, bundles_deleted, files);
@@ -3558,7 +3705,7 @@ int StructBridgePlugin::apiImport(const std::string &name_or_path, std::string &
                 maybe_bundle = true;
             }
         }
-        file = maybe_bundle ? bundleDirInLibrary(name) : libraryDir() / sanitizeRelativePath(name);
+        file = maybe_bundle ? bundleDirInLibrary(name) : libraryDir() / libraryRelativePath(name);
     }
     if (!isValidStructureName(name)) {
         msg = "结构名称非法: " + name;
@@ -3637,8 +3784,8 @@ int StructBridgePlugin::apiImport(const std::string &name_or_path, std::string &
         msg = std::string("导入失败 (阶段: ") + stageName(rc) + ")";
         return rc;
     }
-    writeStructureFile(libraryDir() / sanitizeRelativePath(name), bytes);
-    writeStructureFile(packStructuresDir() / sanitizeRelativePath(name), bytes);
+    writeStructureFile(libraryDir() / libraryRelativePath(name), bytes);
+    writeStructureFile(packStructuresDir() / packRelativePath(name), bytes);
     msg = "导入成功: " + name + " (" + std::to_string(bytes.size()) + " 字节, key=" + key + ")";
     getLogger().info("[api] Imported '{}' ({} bytes) from {}", name, bytes.size(), pathToUtf8(file));
     return STAGE_OK;
@@ -3685,7 +3832,7 @@ int StructBridgePlugin::apiDump(const std::string &name, std::string &msg)
         msg = std::string("序列化失败 (阶段: ") + stageName(bstage) + ")";
         return bstage;
     }
-    auto out_file = libraryDir() / sanitizeRelativePath(clean);
+    auto out_file = libraryDir() / libraryRelativePath(clean);
     std::error_code ec;
     fs::create_directories(out_file.parent_path(), ec);
     {
@@ -3701,7 +3848,7 @@ int StructBridgePlugin::apiDump(const std::string &name, std::string &msg)
             return STAGE_FILE;
         }
     }
-    writeStructureFile(packStructuresDir() / sanitizeRelativePath(clean), bytes);
+    writeStructureFile(packStructuresDir() / packRelativePath(clean), bytes);
     msg = pathToUtf8(out_file);
     getLogger().info("[api] Dumped '{}' ({} bytes) to {}", clean, bytes.size(), pathToUtf8(out_file));
     return STAGE_OK;
@@ -3746,13 +3893,7 @@ int StructBridgePlugin::apiDelete(const char *name_or_null, std::string &msg)
                 dispatch_engine_delete(item.key);
             }
             ++structures;
-            for (const auto &f : {libraryDir() / pathFromUtf8(item.ns) / pathFromUtf8(item.local + ".mcstructure"),
-                                  item.mirror}) {
-                std::error_code ec;
-                if (fs::exists(f, ec) && fs::remove(f, ec)) {
-                    ++files;
-                }
-            }
+            files += removeStructureFiles(item.ns, item.local);
         }
         if (structures == 0 && bundles_deleted == 0) {
             msg = "没有插件管理的结构可删除";
@@ -3802,20 +3943,10 @@ int StructBridgePlugin::apiDelete(const char *name_or_null, std::string &msg)
     }
 
     dispatch_engine_delete(key);
-    std::vector<fs::path> files = {
-        libraryDir() / "mystructure" / pathFromUtf8(local + ".mcstructure"),
-        packStructuresDir() / "mystructure" / pathFromUtf8(local + ".mcstructure"),
-    };
-    int removed = 0;
-    std::error_code ec;
-    for (const auto &f : files) {
-        if (fs::exists(f, ec) && fs::remove(f, ec)) {
-            ++removed;
-        }
-    }
+    const int removed = removeStructureFiles("mystructure", local);
     msg = "已删除 '" + local + "' (引擎内存 + 世界数据库" +
-          (removed > 0 ? ", " + std::to_string(removed) + " 个文件" : "") + ")";
-    getLogger().info("[api] Delete '{}': engine command dispatched, {} file(s) removed", local, removed);
+          (removed > 0 ? ", " + std::to_string(removed) + " 个文件条目" : "") + ")";
+    getLogger().info("[api] Delete '{}': engine command dispatched, {} file entries removed", local, removed);
     return STAGE_OK;
 }
 
@@ -3853,6 +3984,7 @@ std::uint64_t StructBridgePlugin::apiExportRegion(const std::string &name, int x
     job->z2 = lz2;
     job->entities = entities;
     job->blocks = blocks;
+    job->dimension = dim;
     job->c_on_done = on_done;
     job->c_ctx = ctx;
     job->py_on_done = py_on_done;
@@ -3940,7 +4072,16 @@ std::uint64_t StructBridgePlugin::apiPlaceStructure(const std::string &name, int
     }
     else {
         if (original) {
-            return 0;  // single structures carry no original position
+            // Restore position + dimension from the library sidecar meta;
+            // only plugin exports carry one.
+            auto meta = readStructureMeta(name);
+            if (meta == nullptr) {
+                return 0;
+            }
+            job->x = meta->x1;
+            job->y = meta->y1;
+            job->z = meta->z1;
+            dim = meta->dimension;
         }
         const std::string full_key = name.find(':') == std::string::npos ? "mystructure:" + name : name;
         bool found = false;
@@ -4536,9 +4677,9 @@ PyMethodDef methods[] = {
     {"place_structure", reinterpret_cast<PyCFunction>(reinterpret_cast<void *>(place_structure)),
      METH_VARARGS | METH_KEYWORDS,
      "place_structure(name, x, y, z, original=False, dimension=None, include_entities=None, include_blocks=None, "
-     "tp_player=None, on_done=None) -> job id. Places a structure or bundle; original=True restores a bundle at "
-     "its exported position/dimension. tp_player: the ONLY player the job may teleport (required for "
-     "non-overworld targets)."},
+     "tp_player=None, on_done=None) -> job id. Places a structure or bundle; original=True restores it at the "
+     "exported position/dimension (bundle manifest or structure meta.json). tp_player: the ONLY player the job "
+     "may teleport (required for non-overworld targets)."},
     {nullptr, nullptr, 0, nullptr},
 };
 

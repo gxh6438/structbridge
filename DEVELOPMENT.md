@@ -90,7 +90,7 @@ pip install endstone==0.11.14
   → 完成：移除 area，回调 on_done
 ```
 
-`original` 走 manifest 里的原始区域/维度，目标坐标由分片 bounds 反推，等价于把整个束平移回导出时的位置。单结构没有世界坐标信息，`original` 直接拒绝。玩家离线（tp 不可用）时束任务允许 partial 完成并警告，单结构直接失败。
+`original` 走 manifest（束）或 `meta.json`（单结构）里的原始区域/维度，目标坐标由分片 bounds 反推（束）或直接取 meta 记录（单结构），等价于把结构平移回导出时的位置。玩家离线（tp 不可用）时束任务允许 partial 完成并警告，单结构直接失败。
 
 ### 结构束（bundle）
 
@@ -102,7 +102,7 @@ pip install endstone==0.11.14
 
 引擎没有结构枚举 API（StructureManager 只有 getOrCreate/getStructure），列表由插件自己合并来源、按引擎键去重（默认只列插件管理的，`all` 才合并全部三来源；束单独显示为一条记录）：
 
-1. 插件结构库（`library/` 目录，首个子目录即命名空间）；
+1. 插件结构库（`library/<ns>/<name>/<name>.mcstructure` 每结构一文件夹，`meta.json` 为插件自有 sidecar，`original` 复原的坐标/维度来源；仅此形状被识别为库条目）；
 2. 各行为包的 `structures/` 目录（`structures/<ns>/<rest>.mcstructure` ⇔ 键 `<ns>:<rest>`）；行为包文件是只读游戏数据，只有插件自己写入 vanilla 包 `mystructure/` 的镜像可删；
 3. 世界 LevelDB（`worlds/<level-name>/db`，level-name 从 server.properties 读取）——`structuretemplate_` 前缀的键。扫描器在 `src/leveldb_scan.{h,cpp}`，独立编译单元、只依赖标准库，磁盘格式说明记录在该头文件注释中。全部只读且 fail-soft：数据库归运行中的服务器所有，任何不一致只跳过对应文件或块。
 
@@ -110,7 +110,7 @@ pip install endstone==0.11.14
 
 ### 名称与路径（UTF-8）
 
-引擎对结构名没有字符限制，LevelDB 按原始 UTF-8 存键。插件的校验（`isValidStructureName`）接受一切合法 UTF-8 序列，拒绝控制字符、空格、引号、路径分隔符和第二个冒号；`sanitizeRelativePath` 原样保留多字节序列、只对小写 ASCII 折叠。Windows 上 `fs::path` 的窄字符转换走 ANSI 代码页会损坏非 ASCII 文件名，所有路径构造和显示统一经过 `pathFromUtf8`/`pathToUtf8`（内部走 UTF-16 宽 API）。
+引擎对结构名没有字符限制，LevelDB 按原始 UTF-8 存键。插件的校验（`isValidStructureName`）接受一切合法 UTF-8 序列，拒绝控制字符、空格、引号、路径分隔符和第二个冒号；`splitStructureName` 原样保留多字节序列、只对小写 ASCII 折叠，`libraryRelativePath`（`<ns>/<name>/<name>.mcstructure`）与 `packRelativePath`（`<ns>/<name>.mcstructure`）基于它分别构造库与镜像路径。Windows 上 `fs::path` 的窄字符转换走 ANSI 代码页会损坏非 ASCII 文件名，所有路径构造和显示统一经过 `pathFromUtf8`/`pathToUtf8`（内部走 UTF-16 宽 API）。
 
 ### 删除
 
